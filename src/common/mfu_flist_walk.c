@@ -48,6 +48,8 @@
 static uint64_t CURRENT_NUM_DIRS;
 static const char** CURRENT_DIRS;
 static flist_t* CURRENT_LIST;
+static flist_t* HARDLINKS_TMP_LIST;
+static inodes_hardlink_map_t* HARDLINKS_INODES_MAP;
 static int SET_DIR_PERMS;
 static int REMOVE_FILES;
 static int DEREFERENCE;
@@ -494,6 +496,67 @@ static void walk_stat_create(CIRCLE_handle* handle)
     }
 }
 
+/* allocate and initialize a new inodes map */
+inodes_hardlink_map_t* inodes_map_new()
+{
+    /* allocate memory for map, cast it to handle, initialize and return */
+    inodes_hardlink_map_t* map = (inodes_hardlink_map_t*) MFU_MALLOC(sizeof(inodes_hardlink_map_t));
+
+    map->inodes = NULL;
+    map->count  = 0;
+    map->cap    = 0;
+
+    return map;
+}
+
+/* free memory of inodes map */
+inodes_hardlink_map_t* inodes_map_free(inodes_hardlink_map_t** map)
+{
+    mfu_free(&(*map)->inodes);
+    mfu_free(map);
+}
+
+/* add new element to running list index, allocates additional
+ * capactiy for index if needed */
+static void inodes_map_insert(inodes_hardlink_map_t* map, uint64_t inode)
+{
+    /* if we have no capacity for the index,
+     * initialize with a small array */
+    uint64_t cap = map->cap;
+    if (cap == 0) {
+        /* have no index at all, initialize it */
+        uint64_t new_capacity = 32;
+        size_t index_size = new_capacity * sizeof(uint64_t);
+        map->inodes = (uint64_t*) MFU_MALLOC(index_size);
+        map->cap = new_capacity;
+    }
+
+    map->count++;
+
+    /* check that our index has space before we add it */
+    uint64_t count = map->count;
+    if (count == cap) {
+        /* we have exhausted the current capacity of the index array,
+         * allocate a new memory region that is double the size */
+        uint64_t new_capacity = cap * 2;
+        size_t index_size = new_capacity * sizeof(uint64_t);
+        uint64_t* new_inodes = (uint64_t*) MFU_MALLOC(index_size);
+
+        /* copy over existing list */
+        memcpy(new_inodes, map->inodes, count * sizeof(uint64_t));
+
+        /* free the old index memory and assign the new one */
+        mfu_free(&map->inodes);
+        map->inodes = new_inodes;
+        map->cap   = new_capacity;
+    }
+
+    /* append the item to the index */
+    map->inodes[count - 1] = inode;
+
+    return;
+}
+
 /** Callback given to process the dataset. */
 static void walk_stat_process(CIRCLE_handle* handle)
 {
@@ -527,8 +590,13 @@ static void walk_stat_process(CIRCLE_handle* handle)
     if (REMOVE_FILES && !S_ISDIR(st.st_mode)) {
         mfu_file_unlink(path, mfu_file);
     } else {
-        /* record info for item in list */
-        mfu_flist_insert_stat(CURRENT_LIST, path, st.st_mode, &st);
+        if (S_ISREG(st.st_mode) && st.st_nlink > 1) {
+            /* record info for item in temporary hardlinks list and inodes map */
+            mfu_flist_insert_stat(HARDLINKS_TMP_LIST, path, st.st_mode, &st);
+            inodes_map_insert(HARDLINKS_INODES_MAP, (uint64_t)st.st_ino);
+        } else
+            /* record info for item in list */
+            mfu_flist_insert_stat(CURRENT_LIST, path, st.st_mode, &st);
     }
 
     /* recurse into directory */
@@ -549,6 +617,287 @@ static void walk_stat_process(CIRCLE_handle* handle)
         /* TODO: check that we can recurse into directory */
         walk_stat_process_dir(path, handle);
     }
+    return;
+}
+
+/* sort flist by name */
+static void walk_hardlinks_sort_names(flist_t* flist, inodes_hardlink_map_t* inodes, flist_t** flist_sorted, inodes_hardlink_map_t** inodes_sorted) {
+
+    uint64_t incount = mfu_flist_size(flist);
+    uint64_t chars = mfu_flist_file_max_name(flist);
+
+    int rank, ranks;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+
+    /* create datatype for packed file list element */
+    MPI_Datatype dt_elem;
+    size_t bytes = mfu_flist_file_pack_size(flist);
+    MPI_Type_contiguous((int)bytes, MPI_BYTE, &dt_elem);
+
+    MPI_Datatype dt_key;
+    DTCMP_Op op_str;
+    DTCMP_Str_create_ascend(chars, &dt_key, &op_str);
+
+    /* build keysat type */
+    MPI_Datatype dt_keysat, keysat_types[3] = { dt_key, MPI_UINT64_T, dt_elem };
+    if (DTCMP_Type_create_series(3, keysat_types, &dt_keysat) != DTCMP_SUCCESS) {
+        MFU_ABORT(1, "Failed to create keysat type");
+    }
+
+    /* get extent of key type */
+    MPI_Aint key_lb, key_extent;
+    MPI_Type_get_extent(dt_key, &key_lb, &key_extent);
+
+    /* get extent of keysat type */
+    MPI_Aint inode_lb, inode_extent;
+    MPI_Type_get_extent(MPI_UINT64_T, &inode_lb, &inode_extent);
+
+    /* get extent of keysat type */
+    MPI_Aint keysat_lb, keysat_extent;
+    MPI_Type_get_extent(dt_keysat, &keysat_lb, &keysat_extent);
+
+    /* compute size of sort element and allocate buffer */
+    size_t sortbufsize = (size_t)keysat_extent * incount;
+    void* sortbuf = MFU_MALLOC(sortbufsize);
+
+    /* copy data into sort elements */
+    char* sortptr = (char*) sortbuf;
+    for (uint64_t idx=0; idx<incount; idx++) {
+        const char* name = mfu_flist_file_get_name(flist, idx);
+        strcpy(sortptr, name);
+        sortptr += key_extent;
+        *(uint64_t *)sortptr = inodes->inodes[idx];
+
+        sortptr += inode_extent;
+        /* pack file element */
+        sortptr += mfu_flist_file_pack(sortptr, flist, idx);
+    }
+
+    /* sort data */
+    void* outsortbuf;
+    int outsortcount;
+    DTCMP_Handle handle;
+    int sort_rc = DTCMP_Sortz(
+                      sortbuf, (int)incount, &outsortbuf, &outsortcount,
+                      dt_key, dt_keysat, op_str, DTCMP_FLAG_NONE,
+                      MPI_COMM_WORLD, &handle
+                  );
+    if (sort_rc != DTCMP_SUCCESS) {
+        MFU_ABORT(1, "Failed to sort data");
+    }
+
+    /* free input buffer holding sort elements */
+    mfu_free(&sortbuf);
+
+    /* create a new list as subset of original list */
+    *flist_sorted = mfu_flist_subset(flist);
+    *inodes_sorted = inodes_map_new();
+
+    /* step through sorted data filenames */
+    sortptr = (char*) outsortbuf;
+    for (uint64_t idx=0; idx<(uint64_t)outsortcount; idx++) {
+        sortptr += key_extent;
+        inodes_map_insert(*inodes_sorted, *(uint64_t*)sortptr);
+        sortptr += inode_extent;
+        sortptr += mfu_flist_file_unpack(sortptr, *flist_sorted);
+    }
+
+    /* build summary of new list */
+    mfu_flist_summarize(*flist_sorted);
+
+    for (uint64_t idx=0; idx<(uint64_t)outsortcount; idx++) {
+        MFU_LOG(MFU_LOG_INFO, "rank: %d sorted path %s inode %llu", rank, mfu_flist_file_get_name(*flist_sorted, idx), inodes->inodes[idx]);
+    }
+
+    /* free memory */
+    DTCMP_Free(&handle);
+
+    DTCMP_Op_free(&op_str);
+    MPI_Type_free(&dt_keysat);
+    MPI_Type_free(&dt_key);
+    MPI_Type_free(&dt_elem);
+
+}
+
+static void walk_hardlinks_rank(flist_t* flist, inodes_hardlink_map_t* inodes) {
+
+    uint64_t incount = mfu_flist_size(flist);
+    uint64_t chars = mfu_flist_file_max_name(flist);
+
+    int rank, ranks;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+
+    uint64_t* rankbuf = NULL;
+    if(incount)
+        rankbuf = (uint64_t*) MFU_MALLOC(sizeof(uint64_t)*incount);
+
+    for(int idx=0; idx<incount; idx++) {
+        MFU_LOG(MFU_LOG_INFO, "rank: %d adding inode %lu", rank, inodes->inodes[idx]);
+        rankbuf[idx] = inodes->inodes[idx];
+    }
+
+    /* rank hardlinks by inode */
+    uint64_t groups = 0;
+    uint64_t output_bytes = incount * sizeof(uint64_t);
+    uint64_t* group_id    = (uint64_t*) MFU_MALLOC(output_bytes);
+    uint64_t* group_ranks = (uint64_t*) MFU_MALLOC(output_bytes);
+    uint64_t* group_rank  = (uint64_t*) MFU_MALLOC(output_bytes);
+    int rank_rc = DTCMP_Rankv(
+                      (int)incount, rankbuf, &groups, group_id, group_ranks,
+                      group_rank, MPI_UINT64_T, MPI_UINT64_T, DTCMP_OP_UINT64T_ASCEND, DTCMP_FLAG_NONE,
+                      MPI_COMM_WORLD);
+
+    if (rank_rc != DTCMP_SUCCESS) {
+        MFU_ABORT(1, "Failed to rank hardlinks inodes");
+    }
+
+    /* For all elements out of rank 0, set file type as MFU_TYPE_HARDLINK */
+    for(int idx=0; idx<incount; idx++) {
+        if(group_rank[idx] != 0)
+            mfu_flist_file_set_type(flist, idx, MFU_TYPE_HARDLINK);
+    }
+    /* free off temporary memory */
+    mfu_free(&group_rank);
+    mfu_free(&group_ranks);
+    mfu_free(&group_id);
+
+    /* free input buffer holding rank elements */
+    mfu_free(&rankbuf);
+
+}
+
+static void walk_hardlinks_propagate_refs(flist_t* flist, inodes_hardlink_map_t* inodes) {
+
+    uint64_t incount = mfu_flist_size(flist);
+    uint64_t chars = mfu_flist_file_max_name(flist);
+
+    int rank, ranks;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+
+    /* Count local ref */
+    int nb_local_refs = 0;
+    for(int idx=0; idx<incount; idx++) {
+        mfu_filetype type = mfu_flist_file_get_type(flist, idx);
+        if (type == MFU_TYPE_FILE)
+            nb_local_refs += 1;
+    }
+
+    /* allgather to get bytes on each process */
+    int* recvcounts = (int*) MFU_MALLOC(ranks * sizeof(int));
+    int* recvdispls = (int*) MFU_MALLOC(ranks * sizeof(int));
+    MPI_Allgather(&nb_local_refs, 1, MPI_INT, recvcounts, 1, MPI_INT, MPI_COMM_WORLD);
+
+    MPI_Aint inode_extent, inode_lb;
+    MPI_Type_get_extent(MPI_UINT64_T, &inode_lb, &inode_extent);
+
+    MPI_Datatype types[2] = { MPI_UINT64_T, MPI_CHAR };
+    MPI_Aint offsets[2] = {0, inode_extent};
+    int blockcounts[2] = { 1, (int)chars};
+
+    MPI_Datatype dt_struct;
+    MPI_Aint struct_extent, struct_lb;
+    MPI_Type_create_struct(2, blockcounts, offsets, types, &dt_struct);
+    MPI_Type_commit(&dt_struct);
+    MPI_Type_get_extent(dt_struct, &struct_lb, &struct_extent);
+
+    /* compute displacements and total number of bytes that we'll receive */
+    size_t allbytes = 0;
+    int disp = 0;
+    for (int i = 0; i < (int) ranks; i++) {
+        recvdispls[i] = disp;
+        disp += (int) recvcounts[i];
+        allbytes += (size_t) recvcounts[i] * struct_extent;
+    }
+
+    /* allocate memory for recv buffers */
+    char* recvbuf = MFU_MALLOC(allbytes);
+    void* sendbuf = NULL;
+
+    if (nb_local_refs) {
+        sendbuf = MFU_MALLOC((size_t)struct_extent * nb_local_refs);
+        char* sendptr = (char*) sendbuf;
+        for(int idx=0; idx<incount; idx++) {
+            mfu_filetype type = mfu_flist_file_get_type(flist, idx);
+            if (type == MFU_TYPE_FILE) {
+                const char* name = mfu_flist_file_get_name(flist, idx);
+                *(uint64_t *)sendptr = inodes->inodes[idx];
+                sendptr += inode_extent;
+                strncpy(sendptr, name, chars);
+                sendptr += (struct_extent - inode_extent);
+            }
+        }
+    }
+
+    MPI_Allgatherv(sendbuf, nb_local_refs, dt_struct, recvbuf, recvcounts, recvdispls, dt_struct, MPI_COMM_WORLD);
+
+    char* recvptr = (char*) recvbuf;
+    for (int i = 0; i < (int) ranks; i++) {
+        for (int j = 0; j<recvcounts[i]; j++) {
+            uint64_t inode = *(uint64_t *)recvptr;
+            const char* ref = recvptr + inode_extent;
+            /* Look for indexes with the name inode and set the refs accordingly */
+            for (int idx=0; idx<incount; idx++) {
+                mfu_filetype type = mfu_flist_file_get_type(flist, idx);
+                if(inodes->inodes[idx] == inode && type == MFU_TYPE_HARDLINK) {
+                    mfu_flist_file_set_ref(flist, idx, ref);
+                }
+            }
+            recvptr += struct_extent;
+        }
+    }
+
+    mfu_free(&recvcounts);
+    mfu_free(&recvdispls);
+    mfu_free(&recvbuf);
+    mfu_free(&sendbuf);
+    MPI_Type_free(&dt_struct);
+
+    return;
+}
+
+static void walk_hardlinks_merge(flist_t* hardlinks_tmp_flist_sorted, flist_t* flist) {
+    int rank;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+    uint64_t incount = mfu_flist_size(hardlinks_tmp_flist_sorted);
+    for(uint64_t idx=0; idx<incount; idx++) {
+        MFU_LOG(MFU_LOG_INFO, "rank: %d merging %s (%d)", rank,
+                mfu_flist_file_get_name(hardlinks_tmp_flist_sorted, idx),
+                mfu_flist_file_get_type(hardlinks_tmp_flist_sorted, idx));
+        mfu_flist_file_copy(hardlinks_tmp_flist_sorted, idx, flist);
+    }
+
+    return;
+}
+
+static void walk_reduce_hardlinks(flist_t* flist, flist_t *hardlinks_tmp_flist, inodes_hardlink_map_t* inodes)
+{
+    flist_t *hardlinks_tmp_flist_sorted;
+    inodes_hardlink_map_t *inodes_sorted;
+
+    /* bail out when no hardlinks in global list */
+    if (!mfu_flist_global_size(hardlinks_tmp_flist)) {
+        inodes_map_free(&inodes);
+        mfu_flist_free(&hardlinks_tmp_flist);
+        return;
+    }
+
+    walk_hardlinks_sort_names(hardlinks_tmp_flist, inodes, &hardlinks_tmp_flist_sorted, &inodes_sorted);
+
+    inodes_map_free(&inodes);
+    mfu_flist_free(&hardlinks_tmp_flist);
+
+    walk_hardlinks_rank(hardlinks_tmp_flist_sorted, inodes_sorted);
+
+    walk_hardlinks_propagate_refs(hardlinks_tmp_flist_sorted, inodes_sorted);
+
+    walk_hardlinks_merge(hardlinks_tmp_flist_sorted, flist);
+
+    mfu_flist_free(&hardlinks_tmp_flist_sorted);
+
     return;
 }
 
@@ -623,12 +972,15 @@ int mfu_flist_walk_paths(uint64_t num_paths, const char** paths,
     CURRENT_NUM_DIRS = num_paths;
     CURRENT_DIRS     = paths;
     CURRENT_LIST     = flist;
+    HARDLINKS_TMP_LIST = mfu_flist_new();
+    HARDLINKS_INODES_MAP = inodes_map_new();
 
     /* we lookup users and groups first in case we can use
      * them to filter the walk */
     flist->detail = 0;
     if (walk_opts->use_stat) {
         flist->detail = 1;
+        HARDLINKS_TMP_LIST->detail = 1;
         if (flist->have_users == 0) {
             mfu_flist_usrgrp_get_users(flist);
         }
@@ -666,6 +1018,12 @@ int mfu_flist_walk_paths(uint64_t num_paths, const char** paths,
     /* run the libcircle job */
     CIRCLE_begin();
     CIRCLE_finalize();
+
+    /* compute hardlinks temporary list global summary */
+    mfu_flist_summarize(HARDLINKS_TMP_LIST);
+
+    /* reduce hardlinks linked list */
+    walk_reduce_hardlinks(flist, HARDLINKS_TMP_LIST, HARDLINKS_INODES_MAP);
 
     /* compute global summary */
     mfu_flist_summarize(bflist);
