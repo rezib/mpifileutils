@@ -1040,12 +1040,12 @@ static int dcmp_strmap_compare(
         dcmp_strmap_item_update(src_map, key, DCMPF_EXIST, DCMPS_COMMON);
         dcmp_strmap_item_update(dst_map, key, DCMPF_EXIST, DCMPS_COMMON);
 
-        /* get modes of files */
-        mode_t src_mode = (mode_t) mfu_flist_file_get_mode(src_list,
+        mfu_filetype src_type =  mfu_flist_file_get_type(src_list,
             src_index);
-        mode_t dst_mode = (mode_t) mfu_flist_file_get_mode(dst_list,
+        mfu_filetype dst_type =  mfu_flist_file_get_type(dst_list,
             dst_index);
 
+        MFU_LOG(MFU_LOG_INFO, "src: %s (%d) dst: %s (%d)", mfu_flist_file_get_name(src_list, src_index), src_type, mfu_flist_file_get_name(dst_list, dst_index), dst_type);
         tmp_rc = dcmp_compare_metadata(src_list, src_map, src_index,
              dst_list, dst_map, dst_index,
              key);
@@ -1061,7 +1061,7 @@ static int dcmp_strmap_compare(
         }
 
         /* check whether files are of the same type */
-        if ((src_mode & S_IFMT) != (dst_mode & S_IFMT)) {
+        if (src_type != dst_type) {
             /* file type is different, no need to go any futher */
             dcmp_strmap_item_update(src_map, key, DCMPF_TYPE, DCMPS_DIFFER);
             dcmp_strmap_item_update(dst_map, key, DCMPF_TYPE, DCMPS_DIFFER);
@@ -1084,16 +1084,16 @@ static int dcmp_strmap_compare(
             continue;
         }
 
-        /* for now, we can only compare content of regular files and symlinks */
-        if (! S_ISREG(dst_mode) && ! S_ISLNK(dst_mode)) {
-            /* not regular file or symlink, take them as common content */
+        /* for now, we can only compare content of regular files, symlinks and hardlinks destinations */
+        if (dst_type != MFU_TYPE_FILE && dst_type != MFU_TYPE_LINK && dst_type != MFU_TYPE_HARDLINK) {
+            /* not regular file, take them as common content */
             dcmp_strmap_item_update(src_map, key, DCMPF_CONTENT, DCMPS_COMMON);
             dcmp_strmap_item_update(dst_map, key, DCMPF_CONTENT, DCMPS_COMMON);
             continue;
         }
 
         /* For symlinks, compare targets */
-        if (S_ISLNK(dst_mode)) {
+        if (dst_type == MFU_TYPE_LINK ) {
             const char* src_name = mfu_flist_file_get_name(src_list, src_index);
             const char* dst_name = mfu_flist_file_get_name(dst_list, dst_index);
             int compare_rc = mfu_compare_symlinks(src_name, dst_name, mfu_src_file, mfu_dst_file);
@@ -1110,6 +1110,24 @@ static int dcmp_strmap_compare(
                 dcmp_strmap_item_update(dst_map, key, DCMPF_CONTENT, DCMPS_COMMON);
             } else {
                 /* update to say contents of the symlinks were found to be different */
+                dcmp_strmap_item_update(src_map, key, DCMPF_CONTENT, DCMPS_DIFFER);
+                dcmp_strmap_item_update(dst_map, key, DCMPF_CONTENT, DCMPS_DIFFER);
+            }
+            continue;
+        }
+
+        /* compare hardlink references */
+        if (dst_type == MFU_TYPE_HARDLINK) {
+            const char* src_ref = mfu_flist_file_get_ref(src_list, src_index) + strlen_prefix;
+            const char* dst_ref = mfu_flist_file_get_ref(dst_list, dst_index) + strlen(dest_path->path);
+
+            MFU_LOG(MFU_LOG_INFO, "Comparing hardlink references %s and %s", src_ref, dst_ref);
+            if(!strcmp(src_ref, dst_ref)) {
+                /* update to say contents of the hardlinks were found to be the same */
+                dcmp_strmap_item_update(src_map, key, DCMPF_CONTENT, DCMPS_COMMON);
+                dcmp_strmap_item_update(dst_map, key, DCMPF_CONTENT, DCMPS_COMMON);
+            } else {
+                /* update to say contents of the hardlinks were found to be different */
                 dcmp_strmap_item_update(src_map, key, DCMPF_CONTENT, DCMPS_DIFFER);
                 dcmp_strmap_item_update(dst_map, key, DCMPF_CONTENT, DCMPS_DIFFER);
             }
