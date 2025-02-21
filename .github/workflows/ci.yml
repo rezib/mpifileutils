@@ -76,8 +76,10 @@ jobs:
       - name: dtcmp checkout
         uses: actions/checkout@v4
         with:
-          repository: 'LLNL/dtcmp'
-          ref: 'v1.1.5'
+          # temporary use patched branch for:
+          # https://github.com/LLNL/dtcmp/issues/19
+          repository: 'rezib/dtcmp'  # should be LLNL/dtcmp
+          ref: 'fix-19'              # should be v1.1.6
           path: 'dtcmp'
       - name: dtcmp autogen
         run: ./autogen.sh
