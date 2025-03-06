@@ -70,6 +70,12 @@ typedef struct {
     size_t io_bufsize;     /* size of memory i/o buffer in bytes */
 } DTAR_writer_t;
 
+/* linked list of archive entries */
+typedef struct entry_list {
+    struct archive_entry* entry;
+    struct entry_list* next;
+} entry_list_t;
+
 DTAR_writer_t DTAR_writer; /* state of open archive file and I/O buffer */
 
 mfu_flist DTAR_flist;                    /* source flist of set of items being copied into archive */
@@ -391,6 +397,8 @@ static int encode_header(
     archive_entry_copy_pathname(entry, relname);
     mfu_free(&relname);
 
+
+
     /* determine whether user wants to encode ACLs and xattrs */
     bool preserve = (opts->preserve_xattrs || opts->preserve_acls || opts->preserve_fflags);
     if (preserve) {
@@ -426,6 +434,7 @@ static int encode_header(
                 flags |= ARCHIVE_READDISK_NO_FFLAGS;
             }
             archive_read_disk_set_behavior(source, flags);
+            MFU_LOG(MFU_LOG_INFO, "archive_read_disk_entry_from_file(): %s", fname);
 
             /* build the entry by querying the item associated with the open
              * file descriptor, on which libarchive calls fstat(). For symlinks,
@@ -444,6 +453,15 @@ static int encode_header(
                     fname, archive_error_string(source)
                 );
                 rc = MFU_FAILURE;
+            }
+
+            /* hardlink not managed by archive_read_disk_entry_from_file(), call
+             * archive_entry_set_hardlink() on the entry afterwhile. */
+
+            if (type == MFU_TYPE_HARDLINK) {
+                const char* target = mfu_flist_file_get_ref(flist, idx);
+                const char* reltarget = mfu_param_path_relative(target, cwdpath);
+                archive_entry_set_hardlink(entry, reltarget);
             }
 
             /* we can free the archive now that we have the entry */
@@ -497,6 +515,10 @@ static int encode_header(
                 );
                 rc = MFU_FAILURE;
             }
+        } else if (type == MFU_TYPE_HARDLINK) {
+            const char* target = mfu_flist_file_get_ref(flist, idx);
+            const char* reltarget = mfu_param_path_relative(target, cwdpath);
+            archive_entry_copy_hardlink(entry, reltarget);
         }
     }
 
@@ -743,6 +765,7 @@ static void DTAR_perform_copy(CIRCLE_handle* handle)
 
     /* get name of user file */
     const char* in_name = op->operand;
+    MFU_LOG(MFU_LOG_INFO, "DTAR_perform_copy '%s'", in_name);
 
     /* open input file for reading */
     int read_flag = 1;
@@ -2156,7 +2179,7 @@ static int compute_entry_sizes(
 
         /* identify item type to compute its size in the archive */
         mfu_filetype type = mfu_flist_file_get_type(flist, idx);
-        if (type == MFU_TYPE_DIR || type == MFU_TYPE_LINK) {
+        if (type == MFU_TYPE_DIR || type == MFU_TYPE_LINK || type == MFU_TYPE_HARDLINK) {
             /* directories and symlinks only need the header */
             uint64_t header_size;
             encode_header(flist, idx, cwdpath,
@@ -2364,6 +2387,7 @@ static int mfu_flist_archive_create_copy_chunk(
         if (opts->open_noatime) {
             flags |= O_NOATIME;
         }
+
         int in_fd = mfu_open(in_name, flags);
         if (in_fd < 0) {
             MFU_LOG(MFU_LOG_ERR, "Failed to open source file '%s' errno=%d %s",
@@ -2663,7 +2687,7 @@ int mfu_flist_archive_create(
     for (idx = 0; idx < listsize; idx++) {
         /* we currently only support regular files, directories, and symlinks */
         mfu_filetype type = mfu_flist_file_get_type(flist, idx);
-        if (type == MFU_TYPE_FILE || type == MFU_TYPE_DIR || type == MFU_TYPE_LINK) {
+        if (type == MFU_TYPE_FILE || type == MFU_TYPE_DIR || type == MFU_TYPE_LINK || type == MFU_TYPE_HARDLINK) {
             /* write header for this item to the archive,
              * this sets DTAR_err on any error */
             write_header(flist, idx, cwdpath,
@@ -3847,9 +3871,20 @@ static void insert_entry_into_flist(
     mfu_flist_file_set_name(flist, idx, fullpath);
     mfu_free(&fullpath);
 
-    /* get mode of entry, and deduce mfu type */
+    /* get mode of entry */
     mode_t mode = archive_entry_mode(entry);
-    mfu_filetype type = mfu_flist_mode_to_filetype(mode);
+    mfu_filetype type = MFU_TYPE_UNKNOWN;
+
+    /* If hardlink target is defined, set type accordingly and reference. Else
+     * deduce type from mode. */
+    const char* target = archive_entry_hardlink(entry);
+    if (target != NULL) {
+        type = MFU_TYPE_HARDLINK;
+        mfu_flist_file_set_ref(flist, idx, target);
+    } else {
+        type = mfu_flist_mode_to_filetype(mode);
+    }
+
     mfu_flist_file_set_type(flist, idx, type);
 
     mfu_flist_file_set_mode(flist, idx, mode);
@@ -4312,6 +4347,7 @@ static int extract_files_offsets_libarchive(
     }
 
     /* iterate over and extract each item we're responsible for */
+    entry_list_t* hardlink_entries = NULL, *current_hardlink_entry = NULL;
     uint64_t count = 0;
     while (count < entry_count && rc == MFU_SUCCESS) {
         /* seek to start of the entry in the archive file */
@@ -4370,6 +4406,25 @@ static int extract_files_offsets_libarchive(
             archive_read_free(a);
             rc = MFU_FAILURE;
             break;
+        }
+
+        /* if hardlink entry, keep a copy of this entry for processing in 2nd pass */
+        if (archive_entry_hardlink(entry) != NULL) {
+            entry_list_t* new_entry = (entry_list_t*) malloc(sizeof(entry_list_t));
+            new_entry->entry = archive_entry_clone(entry);
+            new_entry->next = NULL;
+            if(!hardlink_entries) {
+                hardlink_entries = new_entry;
+            }
+            if(!current_hardlink_entry) {
+                current_hardlink_entry = new_entry;
+            } else {
+                current_hardlink_entry->next = new_entry;
+                current_hardlink_entry = current_hardlink_entry->next;
+            }
+            /* advance to our next entry */
+            count++;
+            continue;
         }
 
         /* got an entry, create corresponding item on disk and
@@ -4435,6 +4490,48 @@ static int extract_files_offsets_libarchive(
         /* advance to our next entry */
         count++;
     }
+
+    /* wait for all tasks to write regular files */
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    current_hardlink_entry = hardlink_entries;
+    while(current_hardlink_entry && rc == MFU_SUCCESS) {
+        /* create hardlink on disk */
+        r = archive_write_header(ext, current_hardlink_entry->entry);
+        if (r != ARCHIVE_OK) {
+            MFU_LOG(MFU_LOG_ERR, "writing entry %s",
+                archive_error_string(ext)
+            );
+            rc = MFU_FAILURE;
+            break;
+        }
+
+        /* set any properties on the item that need to be set at end,
+         * e.g., turn off write bit on a file we just wrote or set timestamps */
+        r = archive_write_finish_entry(ext);
+        if (r != ARCHIVE_OK) {
+            MFU_LOG(MFU_LOG_ERR, "finish writing entry %s",
+                archive_error_string(ext)
+            );
+            rc = MFU_FAILURE;
+            break;
+        }
+
+        /* increment our count of items extracted */
+        reduce_buf[REDUCE_ITEMS]++;
+
+        /* update number of items we have completed for progress messages */
+        mfu_progress_update(reduce_buf, extract_prog);
+
+        /* jump to next hardlink and free current hardlink entry*/
+        entry_list_t* previous_hardlink_entry = current_hardlink_entry;
+        current_hardlink_entry = current_hardlink_entry->next;
+        archive_entry_free(previous_hardlink_entry->entry);
+        free(previous_hardlink_entry);
+        previous_hardlink_entry = NULL;
+    }
+    /* Free hardlinks entries list */
+    hardlink_entries = NULL;
 
     /* close out our write archive, this may update timestamps and permissions on items */
     r = archive_write_close(ext);
@@ -4840,8 +4937,7 @@ static int extract_files(
     int ranks;
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
 
-    /* iterate over all entry from the start of the file,
-     * looking to find the range of items it is responsible for */
+    entry_list_t* hardlink_entries = NULL, *current_hardlink_entry = NULL;
     uint64_t count = 0;
     while (rc == MFU_SUCCESS) {
         /* read the next entry from the archive */
@@ -4860,6 +4956,25 @@ static int extract_files(
 
         /* write item out to disk if this is one of our assigned items */
         if (count % ranks == mfu_rank) {
+            /* ff hardlink entry, keep a copy of this entry for processing in 2nd pass */
+            if (archive_entry_hardlink(entry) != NULL) {
+                entry_list_t* new_entry = (entry_list_t*) malloc(sizeof(entry_list_t));
+                new_entry->entry = archive_entry_clone(entry);
+                new_entry->next = NULL;
+                if(!hardlink_entries) {
+                    hardlink_entries = new_entry;
+                }
+                if(!current_hardlink_entry) {
+                    current_hardlink_entry = new_entry;
+                } else {
+                    current_hardlink_entry->next = new_entry;
+                    current_hardlink_entry = current_hardlink_entry->next;
+                }
+                /* advance to next entry in the archive */
+                count++;
+                continue;
+            }
+
             /* create item on disk */
             r = archive_write_header(ext, entry);
             if (r != ARCHIVE_OK) {
@@ -4898,6 +5013,48 @@ static int extract_files(
         /* advance to next entry in the archive */
         count++;
     }
+
+    /* wait for all tasks to write regular files */
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    current_hardlink_entry = hardlink_entries;
+    while(current_hardlink_entry && rc == MFU_SUCCESS) {
+        /* create hardlink on disk */
+        r = archive_write_header(ext, current_hardlink_entry->entry);
+        if (r != ARCHIVE_OK) {
+            MFU_LOG(MFU_LOG_ERR, "writing entry %s",
+                archive_error_string(ext)
+            );
+            rc = MFU_FAILURE;
+            break;
+        }
+
+        /* set any properties on the item that need to be set at end,
+         * e.g., turn off write bit on a file we just wrote or set timestamps */
+        r = archive_write_finish_entry(ext);
+        if (r != ARCHIVE_OK) {
+            MFU_LOG(MFU_LOG_ERR, "finish writing entry %s",
+                archive_error_string(ext)
+            );
+            rc = MFU_FAILURE;
+            break;
+        }
+
+        /* increment our count of items extracted */
+        reduce_buf[REDUCE_ITEMS]++;
+
+        /* update number of items we have completed for progress messages */
+        mfu_progress_update(reduce_buf, extract_prog);
+
+        /* jump to next hardlink and free current hardlink entry*/
+        entry_list_t* previous_hardlink_entry = current_hardlink_entry;
+        current_hardlink_entry = current_hardlink_entry->next;
+        archive_entry_free(previous_hardlink_entry->entry);
+        free(previous_hardlink_entry);
+        previous_hardlink_entry = NULL;
+    }
+    /* Free hardlinks entries list */
+    hardlink_entries = NULL;
 
     /* free off our write archive, this may update timestamps and permissions on items */
     r = archive_write_close(ext);
@@ -5105,6 +5262,190 @@ static int extract_symlinks(
             /* if we still failed, give up */
             if (symlink_rc != 0) {
                 MFU_LOG(MFU_LOG_ERR, "Failed to set symlink `%s' (errno=%d %s)",
+                    name, errno, strerror(errno));
+                rc = MFU_FAILURE;
+            }
+        }
+
+        /* close out the read archive object */
+        r = archive_read_close(a);
+        if (r != ARCHIVE_OK) {
+            MFU_LOG(MFU_LOG_ERR, "Failed to close read archive %s",
+                archive_error_string(a)
+            );
+            rc = MFU_FAILURE;
+        }
+
+        /* free memory allocated in read archive object */
+        r = archive_read_free(a);
+        if (r != ARCHIVE_OK) {
+            MFU_LOG(MFU_LOG_ERR, "Failed to free read archive %s",
+                archive_error_string(a)
+            );
+            rc = MFU_FAILURE;
+        }
+    }
+
+    /* close the archive file */
+    mfu_close(filename, fd);
+
+    /* figure out whether anyone failed */
+    if (! mfu_alltrue(rc == MFU_SUCCESS, MPI_COMM_WORLD)) {
+        rc = MFU_FAILURE;
+    }
+
+    return rc;
+}
+
+/* iterate through our portion of the given file list,
+ * identify hardlinks and extract them from archive */
+ static int extract_hardlinks(
+    const char* filename,     /* name of archive file */
+    mfu_flist flist,          /* file list of items */
+    uint64_t* offsets,        /* offset of each item in the archive */
+    mfu_archive_opts_t* opts) /* options to configure extraction operation */
+{
+    int rc = MFU_SUCCESS;
+
+    /* iterate over all items in our list and count hardlinks */
+    uint64_t count = 0;
+    uint64_t idx;
+    uint64_t size = mfu_flist_size(flist);
+    for (idx = 0; idx < size; idx++) {
+        mfu_filetype type = mfu_flist_file_get_type(flist, idx);
+        if (type == MFU_TYPE_HARDLINK) {
+            /* found a hardlink */
+            count++;
+        }
+    }
+
+    /* count total number of links */
+    uint64_t all_count;
+    MPI_Allreduce(&count, &all_count, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+
+    /* bail out early if there is nothing to do */
+    if (all_count == 0) {
+        return MFU_SUCCESS;
+    }
+
+    /* let user know what we're doing */
+    MPI_Barrier(MPI_COMM_WORLD);
+    if (mfu_rank == 0) {
+        MFU_LOG(MFU_LOG_INFO, "Creating %llu hardlinks", (unsigned long long)all_count);
+    }
+
+    /* open the archive file for reading */
+    int fd = mfu_open(filename, O_RDONLY);
+    if (fd < 0) {
+        MFU_LOG(MFU_LOG_ERR, "Failed to open archive: '%s' errno=%d %s",
+            filename, errno, strerror(errno)
+        );
+        rc = MFU_FAILURE;
+    }
+
+    /* check that everyone opened the archive successfully */
+    if (! mfu_alltrue(rc == MFU_SUCCESS, MPI_COMM_WORLD)) {
+        /* someone failed, close the file if we opened it and return */
+        if (fd >= 0) {
+            mfu_close(filename, fd);
+        }
+        return MFU_FAILURE;
+    }
+
+    /* get global offset of our portion of the list */
+    uint64_t global_offset = mfu_flist_global_offset(flist);
+
+    /* iterate over all items in our list and create any hardlinks */
+    for (idx = 0; idx < size; idx++) {
+        /* skip entries that are not hardlinks */
+        mfu_filetype type = mfu_flist_file_get_type(flist, idx);
+        if (type != MFU_TYPE_HARDLINK) {
+            /* not a hardlink, go to next item */
+            continue;
+        }
+
+        /* got a symlink, get its path */
+        const char* name = mfu_flist_file_get_name(flist, idx);
+
+        /* seek to start of the corresponding entry in the archive file */
+        uint64_t global_idx = global_offset + idx;
+        off_t offset = (off_t) offsets[global_idx];
+        off_t pos = mfu_lseek(filename, fd, offset, SEEK_SET);
+        if (pos == (off_t)-1) {
+            MFU_LOG(MFU_LOG_ERR, "Failed to seek to offset %llu in open archive: '%s' errno=%d %s",
+                offset, filename, errno, strerror(errno)
+            );
+            rc = MFU_FAILURE;
+            continue;
+        }
+
+        /* initiate archive object for reading */
+        struct archive* a = archive_read_new();
+
+        /* when using offsets, we assume there is no compression */
+//        archive_read_support_filter_bzip2(a);
+//        archive_read_support_filter_gzip(a);
+//        archive_read_support_filter_compress(a);
+        archive_read_support_format_tar(a);
+
+        /* use a small read block size, since we just need the header */
+        int r = archive_read_open_fd(a, fd, 10240);
+        if (r != ARCHIVE_OK) {
+            MFU_LOG(MFU_LOG_ERR, "opening archive to extract hardlink `%s' at offset %llu %s",
+                name, offset, archive_error_string(a)
+            );
+            archive_read_free(a);
+            rc = MFU_FAILURE;
+            continue;
+        }
+
+        /* read the entry header for this item */
+        struct archive_entry* entry;
+        r = archive_read_next_header(a, &entry);
+        if (r == ARCHIVE_EOF) {
+            MFU_LOG(MFU_LOG_ERR, "Unexpected end of archive while extracting hardlink `%s' at offset %llu",
+                name, offset
+            );
+            archive_read_close(a);
+            archive_read_free(a);
+            rc = MFU_FAILURE;
+            continue;
+        }
+        if (r != ARCHIVE_OK) {
+            MFU_LOG(MFU_LOG_ERR, "Extracting hardlink '%s' at offset %llu %s",
+                name, offset, archive_error_string(a)
+            );
+            archive_read_close(a);
+            archive_read_free(a);
+            rc = MFU_FAILURE;
+            continue;
+        }
+
+        /* get target of the link */
+        const char* target = archive_entry_hardlink(entry);
+        if (target == NULL) {
+            MFU_LOG(MFU_LOG_ERR, "Item is not a hardlink as expected `%s'",
+                name);
+            archive_read_close(a);
+            archive_read_free(a);
+            rc = MFU_FAILURE;
+            continue;
+        }
+
+        /* create the link on the file system */
+        int hardlink_rc = mfu_hardlink(target, name);
+        if (hardlink_rc != 0) {
+            /* TODO: check whether user wants overwrite */
+            if (errno == EEXIST) {
+                /* failed because something exists,
+                 * attempt to delete item and try again */
+                mfu_unlink(name);
+                hardlink_rc = mfu_hardlink(target, name);
+            }
+
+            /* if we still failed, give up */
+            if (hardlink_rc != 0) {
+                MFU_LOG(MFU_LOG_ERR, "Failed to set hardlink `%s' (errno=%d %s)",
                     name, errno, strerror(errno));
                 rc = MFU_FAILURE;
             }
@@ -5608,6 +5949,13 @@ int mfu_flist_archive_extract(
             int tmp_rc = extract_symlinks(filename, flist, offsets, opts);
             if (tmp_rc != MFU_SUCCESS) {
                 /* tried but failed to get some symlink, so mark as failure */
+                ret = tmp_rc;
+            }
+
+            /* create hardlinks */
+            tmp_rc = extract_hardlinks(filename, flist, offsets, opts);
+            if (tmp_rc != MFU_SUCCESS) {
+                /* tried but failed to get some hardlink, so mark as failure */
                 ret = tmp_rc;
             }
 
