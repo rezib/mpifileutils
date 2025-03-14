@@ -1095,7 +1095,7 @@ void mfu_flist_stat(
   mfu_file_t* mfu_file)
 {
     flist_t* file_list = (flist_t*)flist;
-    /* lists to tracks and resolve hardlinks */
+    /* lists to track and resolve hardlinks */
     flist_t* hardlinks_tmp_list = mfu_flist_new();
     inodes_hardlink_map_t* hardlinks_inodes_map = inodes_map_new();
 
