@@ -235,15 +235,20 @@ class TestFileTreeCmp(unittest.TestCase):
         if ignore_paths is None:
             ignore_paths = []
         try:
-            # Search for ignored items in this directory
-            for _ignore in ignore_paths:
-                # FIXME: use filters
-                for item, fso in dir1.content.copy().items():
-                    if str(fso.path.relative_to(root_dir1)) == _ignore:
-                        del dir1.content[item]
-                for item, fso in dir2.content.copy().items():
-                    if str(fso.path.relative_to(root_dir2)) == _ignore:
-                        del dir2.content[item]
+            # discard ignored items in this directory
+            if ignore_paths:
+                dir1.content = {
+                    key: value
+                    for key, value in dir1.content.items()
+                    if str(value.path.relative_to(root_dir1))
+                    not in ignore_paths
+                }
+                dir2.content = {
+                    key: value
+                    for key, value in dir2.content.items()
+                    if str(value.path.relative_to(root_dir2))
+                    not in ignore_paths
+                }
             self.assertCountEqual(
                 dir1.content.keys(),
                 dir2.content.keys(),

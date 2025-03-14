@@ -2,7 +2,6 @@
 
 import tarfile
 from pathlib import Path
-import shutil
 import os
 import textwrap
 import typing as t

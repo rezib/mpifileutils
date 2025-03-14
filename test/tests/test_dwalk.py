@@ -1,6 +1,5 @@
 #!/usr/bin/python3
 
-import os
 import tempfile
 import typing as t
 from pathlib import Path
@@ -115,7 +114,7 @@ class TestDwalkBasic(TestDwalk):
             self.assertIn(entry, content)
 
     def test_walk_output_text(self):
-        with tempfile.NamedTemporaryFile(mode='w+') as fh:
+        with tempfile.NamedTemporaryFile(mode="w+") as fh:
             output = Path(fh.name)
         self.run_dwalk(output=output, text=True)
         # Check dwalk has created file
@@ -137,7 +136,7 @@ class TestDwalkBasic(TestDwalk):
             self.assertRegex(content, entry)
 
     def test_walk_input(self):
-        with tempfile.NamedTemporaryFile(mode='w+') as fh:
+        with tempfile.NamedTemporaryFile(mode="w+") as fh:
             cache = Path(fh.name)
             self.run_dwalk(output=cache)
             proc = self.run_dwalk(input=cache)
@@ -155,7 +154,7 @@ class TestDwalkBasic(TestDwalk):
             )
 
     def test_walk_input_lite(self):
-        with tempfile.NamedTemporaryFile(mode='w+') as fh:
+        with tempfile.NamedTemporaryFile(mode="w+") as fh:
             cache = Path(fh.name)
             self.run_dwalk(output=cache, lite=True)
             proc = self.run_dwalk(input=cache)

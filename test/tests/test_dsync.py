@@ -194,7 +194,45 @@ class TestDsyncBasic(TestDsync):
         )
         self.assertSrcDstEqual()
 
-    # FIXME: test symlink dereference on file with nlink > 1 (creates hardlink)
+    def test_dsync_symlink_dereference_target_nlinks(self):
+        # change symlink2 target in source for file3 which has nlink > 1 and
+        # synchronize with dereference.
+        (self.src / "symlink2").unlink()
+        (self.src / "symlink2").symlink_to("file3")
+        proc = self.run_dsync(dereference=True)
+
+        # FIXME: when symlinks target file with multiple links (nlink > 1),
+        # dsync creates in destination an additional link to this inode instead
+        # of a regular copy for this symlink.
+
+        # Check source and destination have the same content, except for
+        # symlinks2, hardlink3 and file3 which have 3 nlinks in destination.
+        self.assertSrcDstEqual(
+            ignore_paths=["file3", "hardlink3", "symlink2", "dir1/symlink1"]
+        )
+        self.assertEqual((self.dst / "file3").stat().st_nlink, 3)
+        self.assertEqual((self.dst / "hardlink3").stat().st_nlink, 3)
+        self.assertEqual((self.dst / "symlink2").stat().st_nlink, 3)
+
+        #  Check inode of symlink2 and file3 are the same.
+        self.assertEqual(
+            (self.dst / "symlink2").stat().st_ino,
+            (self.dst / "file3").stat().st_ino,
+        )
+
+        # Check dsync reported creation of 2 hardlinks and 0 symlink.
+        self.assertInProcStdout(
+            proc,
+            textwrap.dedent(
+                """
+                    Items: 8
+                      Directories: 1
+                      Files: 5
+                      Links: 0
+                      Hardlinks: 2
+                """
+            ),
+        )
 
     def test_dsync_transform_hardlink(self):
         # Synchronize, transform hardlink in standalone inode, re-synchronize
