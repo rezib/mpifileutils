@@ -1183,8 +1183,8 @@ void mfu_flist_stat(
 
     /* compute hardlinks temporary list global summary */
     mfu_flist_summarize(hardlinks_tmp_list);
-    /* reduce hardlinks linked list */
-    walk_reduce_hardlinks(flist, hardlinks_tmp_list, hardlinks_inodes_map);
+    /* resolve hardlinks and merge them in flist */
+    walk_resolve_hardlinks(flist, hardlinks_tmp_list, hardlinks_inodes_map);
 
     /* compute global summary */
     mfu_flist_summarize(flist);
