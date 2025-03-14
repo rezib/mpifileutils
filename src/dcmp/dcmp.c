@@ -1045,7 +1045,6 @@ static int dcmp_strmap_compare(
         mfu_filetype dst_type =  mfu_flist_file_get_type(dst_list,
             dst_index);
 
-        MFU_LOG(MFU_LOG_INFO, "src: %s (%d) dst: %s (%d)", mfu_flist_file_get_name(src_list, src_index), src_type, mfu_flist_file_get_name(dst_list, dst_index), dst_type);
         tmp_rc = dcmp_compare_metadata(src_list, src_map, src_index,
              dst_list, dst_map, dst_index,
              key);
@@ -1084,7 +1083,8 @@ static int dcmp_strmap_compare(
             continue;
         }
 
-        /* for now, we can only compare content of regular files, symlinks and hardlinks destinations */
+        /* for now, we can only compare content of regular files, symlinks and
+         * hardlinks destinations */
         if (dst_type != MFU_TYPE_FILE && dst_type != MFU_TYPE_LINK && dst_type != MFU_TYPE_HARDLINK) {
             /* not regular file, take them as common content */
             dcmp_strmap_item_update(src_map, key, DCMPF_CONTENT, DCMPS_COMMON);
@@ -1093,7 +1093,7 @@ static int dcmp_strmap_compare(
         }
 
         /* For symlinks, compare targets */
-        if (dst_type == MFU_TYPE_LINK ) {
+        if (dst_type == MFU_TYPE_LINK) {
             const char* src_name = mfu_flist_file_get_name(src_list, src_index);
             const char* dst_name = mfu_flist_file_get_name(dst_list, dst_index);
             int compare_rc = mfu_compare_symlinks(src_name, dst_name, mfu_src_file, mfu_dst_file);
@@ -1120,8 +1120,6 @@ static int dcmp_strmap_compare(
         if (dst_type == MFU_TYPE_HARDLINK) {
             const char* src_ref = mfu_flist_file_get_ref(src_list, src_index) + strlen_prefix;
             const char* dst_ref = mfu_flist_file_get_ref(dst_list, dst_index) + strlen(dest_path->path);
-
-            MFU_LOG(MFU_LOG_INFO, "Comparing hardlink references %s and %s", src_ref, dst_ref);
             if(!strcmp(src_ref, dst_ref)) {
                 /* update to say contents of the hardlinks were found to be the same */
                 dcmp_strmap_item_update(src_map, key, DCMPF_CONTENT, DCMPS_COMMON);
