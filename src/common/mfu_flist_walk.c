@@ -620,15 +620,12 @@ static void walk_stat_process(CIRCLE_handle* handle)
     return;
 }
 
-/* sort flist by name */
-static void walk_hardlinks_sort_names(flist_t* flist, inodes_hardlink_map_t* inodes, flist_t** flist_sorted, inodes_hardlink_map_t** inodes_sorted) {
+/* sort elements in flist and inodes by name and place them in sorted_list and
+ * sorted_inodes respectively. */
+static void walk_hardlinks_sort_names(flist_t* flist, inodes_hardlink_map_t* inodes, flist_t** sorted_flist, inodes_hardlink_map_t** sorted_inodes) {
 
     uint64_t incount = mfu_flist_size(flist);
     uint64_t chars = mfu_flist_file_max_name(flist);
-
-    int rank, ranks;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &ranks);
 
     /* create datatype for packed file list element */
     MPI_Datatype dt_elem;
@@ -691,24 +688,20 @@ static void walk_hardlinks_sort_names(flist_t* flist, inodes_hardlink_map_t* ino
     mfu_free(&sortbuf);
 
     /* create a new list as subset of original list */
-    *flist_sorted = mfu_flist_subset(flist);
-    *inodes_sorted = inodes_map_new();
+    *sorted_flist = mfu_flist_subset(flist);
+    *sorted_inodes = inodes_map_new();
 
     /* step through sorted data filenames */
     sortptr = (char*) outsortbuf;
     for (uint64_t idx=0; idx<(uint64_t)outsortcount; idx++) {
         sortptr += key_extent;
-        inodes_map_insert(*inodes_sorted, *(uint64_t*)sortptr);
+        inodes_map_insert(*sorted_inodes, *(uint64_t*)sortptr);
         sortptr += inode_extent;
-        sortptr += mfu_flist_file_unpack(sortptr, *flist_sorted);
+        sortptr += mfu_flist_file_unpack(sortptr, *sorted_flist);
     }
 
-    /* build summary of new list */
-    mfu_flist_summarize(*flist_sorted);
-
-    for (uint64_t idx=0; idx<(uint64_t)outsortcount; idx++) {
-        MFU_LOG(MFU_LOG_INFO, "rank: %d sorted path %s inode %llu", rank, mfu_flist_file_get_name(*flist_sorted, idx), inodes->inodes[idx]);
-    }
+    /* compute summary of new list */
+    mfu_flist_summarize(*sorted_flist);
 
     /* free memory */
     DTCMP_Free(&handle);
@@ -720,25 +713,20 @@ static void walk_hardlinks_sort_names(flist_t* flist, inodes_hardlink_map_t* ino
 
 }
 
+/* rank elements in flist by inodes in order to determine reference and secondary
+ * links (aka. hardlinks). */
 static void walk_hardlinks_rank(flist_t* flist, inodes_hardlink_map_t* inodes) {
 
     uint64_t incount = mfu_flist_size(flist);
     uint64_t chars = mfu_flist_file_max_name(flist);
 
-    int rank, ranks;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &ranks);
-
     uint64_t* rankbuf = NULL;
     if(incount)
         rankbuf = (uint64_t*) MFU_MALLOC(sizeof(uint64_t)*incount);
 
-    for(int idx=0; idx<incount; idx++) {
-        MFU_LOG(MFU_LOG_INFO, "rank: %d adding inode %lu", rank, inodes->inodes[idx]);
+    for(int idx=0; idx<incount; idx++)
         rankbuf[idx] = inodes->inodes[idx];
-    }
 
-    /* rank hardlinks by inode */
     uint64_t groups = 0;
     uint64_t output_bytes = incount * sizeof(uint64_t);
     uint64_t* group_id    = (uint64_t*) MFU_MALLOC(output_bytes);
@@ -753,7 +741,8 @@ static void walk_hardlinks_rank(flist_t* flist, inodes_hardlink_map_t* inodes) {
         MFU_ABORT(1, "Failed to rank hardlinks inodes");
     }
 
-    /* For all elements out of rank 0, set file type as MFU_TYPE_HARDLINK */
+    /* The rank 0 is considered the reference link to the inode (ie. the regular
+     * file). Set file type MFU_TYPE_HARDLINK on all other elements. */
     for(int idx=0; idx<incount; idx++) {
         if(group_rank[idx] != 0)
             mfu_flist_file_set_type(flist, idx, MFU_TYPE_HARDLINK);
@@ -768,13 +757,14 @@ static void walk_hardlinks_rank(flist_t* flist, inodes_hardlink_map_t* inodes) {
 
 }
 
+/* propagate the determined references names of all inodes with multiple links
+ * for all hardlinks on these inodes.*/
 static void walk_hardlinks_propagate_refs(flist_t* flist, inodes_hardlink_map_t* inodes) {
 
     uint64_t incount = mfu_flist_size(flist);
     uint64_t chars = mfu_flist_file_max_name(flist);
 
-    int rank, ranks;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    int ranks;
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
 
     /* Count local ref */
@@ -816,6 +806,7 @@ static void walk_hardlinks_propagate_refs(flist_t* flist, inodes_hardlink_map_t*
     char* recvbuf = MFU_MALLOC(allbytes);
     void* sendbuf = NULL;
 
+    /* fill sendbuf with local references */
     if (nb_local_refs) {
         sendbuf = MFU_MALLOC((size_t)struct_extent * nb_local_refs);
         char* sendptr = (char*) sendbuf;
@@ -833,13 +824,14 @@ static void walk_hardlinks_propagate_refs(flist_t* flist, inodes_hardlink_map_t*
 
     MPI_Allgatherv(sendbuf, nb_local_refs, dt_struct, recvbuf, recvcounts, recvdispls, dt_struct, MPI_COMM_WORLD);
 
+    /* set reference on all local hardlinks */
     char* recvptr = (char*) recvbuf;
     for (int i = 0; i < (int) ranks; i++) {
-        for (int j = 0; j<recvcounts[i]; j++) {
+        for (int j = 0; j < recvcounts[i]; j++) {
             uint64_t inode = *(uint64_t *)recvptr;
             const char* ref = recvptr + inode_extent;
-            /* Look for indexes with the name inode and set the refs accordingly */
-            for (int idx=0; idx<incount; idx++) {
+            /* look for indexes with the name inode and set the refs accordingly */
+            for (int idx = 0; idx < incount; idx++) {
                 mfu_filetype type = mfu_flist_file_get_type(flist, idx);
                 if(inodes->inodes[idx] == inode && type == MFU_TYPE_HARDLINK) {
                     mfu_flist_file_set_ref(flist, idx, ref);
@@ -855,48 +847,50 @@ static void walk_hardlinks_propagate_refs(flist_t* flist, inodes_hardlink_map_t*
     mfu_free(&sendbuf);
     MPI_Type_free(&dt_struct);
 
-    return;
 }
 
-static void walk_hardlinks_merge(flist_t* hardlinks_tmp_flist_sorted, flist_t* flist) {
-    int rank;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+/* extend flist with add all items from sorted_hardlinks_flist */
+static void walk_hardlinks_merge(flist_t* flist, flist_t* sorted_hardlinks_flist) {
 
-    uint64_t incount = mfu_flist_size(hardlinks_tmp_flist_sorted);
-    for(uint64_t idx=0; idx<incount; idx++) {
-        MFU_LOG(MFU_LOG_INFO, "rank: %d merging %s (%d)", rank,
-                mfu_flist_file_get_name(hardlinks_tmp_flist_sorted, idx),
-                mfu_flist_file_get_type(hardlinks_tmp_flist_sorted, idx));
-        mfu_flist_file_copy(hardlinks_tmp_flist_sorted, idx, flist);
-    }
+    uint64_t incount = mfu_flist_size(sorted_hardlinks_flist);
+    for(uint64_t idx=0; idx<incount; idx++)
+        mfu_flist_file_copy(sorted_hardlinks_flist, idx, flist);
 
-    return;
 }
 
-static void walk_reduce_hardlinks(flist_t* flist, flist_t *hardlinks_tmp_flist, inodes_hardlink_map_t* inodes)
+/* resolve hardlinks (identify references and secondary links) in hardlinks_flist and merge them in flist */
+static void walk_resolve_hardlinks(flist_t* flist, flist_t *hardlinks_flist, inodes_hardlink_map_t* inodes)
 {
-    flist_t *hardlinks_tmp_flist_sorted;
-    inodes_hardlink_map_t *inodes_sorted;
+    flist_t *sorted_hardlinks_flist;
+    inodes_hardlink_map_t *sorted_inodes;
 
     /* bail out when no hardlinks in global list */
-    if (!mfu_flist_global_size(hardlinks_tmp_flist)) {
+    if (!mfu_flist_global_size(hardlinks_flist)) {
         inodes_map_free(&inodes);
-        mfu_flist_free(&hardlinks_tmp_flist);
+        mfu_flist_free(&hardlinks_flist);
         return;
     }
 
-    walk_hardlinks_sort_names(hardlinks_tmp_flist, inodes, &hardlinks_tmp_flist_sorted, &inodes_sorted);
+    /* sort hardlinks list by name in order to get deterministic lists and
+     * ranking, and minimize differences in dcmp/dsync eventually. */
+    walk_hardlinks_sort_names(hardlinks_flist, inodes, &sorted_hardlinks_flist, &sorted_inodes);
 
+    /* free inodes map and unsorted hardlinks list */
     inodes_map_free(&inodes);
-    mfu_flist_free(&hardlinks_tmp_flist);
+    mfu_flist_free(&hardlinks_flist);
 
-    walk_hardlinks_rank(hardlinks_tmp_flist_sorted, inodes_sorted);
+    /* rank links to inodes to determine reference and secondary links */
+    walk_hardlinks_rank(sorted_hardlinks_flist, sorted_inodes);
 
-    walk_hardlinks_propagate_refs(hardlinks_tmp_flist_sorted, inodes_sorted);
+    /* propagate reference paths to all ranks */
+    walk_hardlinks_propagate_refs(sorted_hardlinks_flist, sorted_inodes);
 
-    walk_hardlinks_merge(hardlinks_tmp_flist_sorted, flist);
+    /* extend flist with add all items from sorted_hardlinks_flist */
+    walk_hardlinks_merge(flist, sorted_hardlinks_flist);
 
-    mfu_flist_free(&hardlinks_tmp_flist_sorted);
+    /* free sorted inodes map and sorted hardlinks list */
+    mfu_flist_free(&sorted_hardlinks_flist);
+    inodes_map_free(&sorted_inodes);
 
     return;
 }
@@ -1022,8 +1016,8 @@ int mfu_flist_walk_paths(uint64_t num_paths, const char** paths,
     /* compute hardlinks temporary list global summary */
     mfu_flist_summarize(HARDLINKS_TMP_LIST);
 
-    /* reduce hardlinks linked list */
-    walk_reduce_hardlinks(flist, HARDLINKS_TMP_LIST, HARDLINKS_INODES_MAP);
+    /* resolve hardlinks and merge them in flist */
+    walk_resolve_hardlinks(flist, HARDLINKS_TMP_LIST, HARDLINKS_INODES_MAP);
 
     /* compute global summary */
     mfu_flist_summarize(bflist);
