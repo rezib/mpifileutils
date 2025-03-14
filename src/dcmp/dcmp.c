@@ -1084,7 +1084,7 @@ static int dcmp_strmap_compare(
         }
 
         /* for now, we can only compare content of regular files, symlinks and
-         * hardlinks destinations */
+         * hardlinks targets */
         if (dst_type != MFU_TYPE_FILE && dst_type != MFU_TYPE_LINK && dst_type != MFU_TYPE_HARDLINK) {
             /* not regular file, take them as common content */
             dcmp_strmap_item_update(src_map, key, DCMPF_CONTENT, DCMPS_COMMON);
