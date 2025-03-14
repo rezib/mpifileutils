@@ -22,32 +22,36 @@ def mpirun_cmd():
     return [mpirun] + args
 
 
+def mfu_cmd(cmd):
+    return mpirun_cmd() + [os.path.join(os.environ["MFU_BIN"], cmd)]
+
+
 def dfilemaker_cmd():
-    return mpirun_cmd() + [os.path.join(os.environ["MFU_BIN"], "dfilemaker")]
+    return mfu_cmd("dfilemaker")
 
 
 def dwalk_cmd():
-    return mpirun_cmd() + [os.path.join(os.environ["MFU_BIN"], "dwalk")]
+    return mfu_cmd("dwalk")
 
 
 def dfind_cmd():
-    return mpirun_cmd() + [os.path.join(os.environ["MFU_BIN"], "dfind")]
+    return mfu_cmd("dfind")
 
 
 def dsync_cmd():
-    return mpirun_cmd() + [os.path.join(os.environ["MFU_BIN"], "dsync")]
+    return mfu_cmd("dsync")
 
 
 def dcp_cmd():
-    return mpirun_cmd() + [os.path.join(os.environ["MFU_BIN"], "dcp")]
+    return mfu_cmd("dcp")
 
 
 def dcmp_cmd():
-    return mpirun_cmd() + [os.path.join(os.environ["MFU_BIN"], "dcmp")]
+    return mfu_cmd("dcmp")
 
 
 def dtar_cmd():
-    return mpirun_cmd() + [os.path.join(os.environ["MFU_BIN"], "dtar")]
+    return mfu_cmd("dtar")
 
 
 def create_file(path: Path):

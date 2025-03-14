@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 
 import tempfile
+import os
 import typing as t
 from pathlib import Path
 import textwrap
@@ -39,7 +40,9 @@ class TestDwalkBasic(TestDwalk):
 
     def setUp(self):
         super().setUp()
+        oldmask = os.umask(0o022)
         create_basic_layout(self.src)
+        os.umask (oldmask)
 
     def test_walk(self):
         proc = self.run_dwalk()
@@ -121,17 +124,17 @@ class TestDwalkBasic(TestDwalk):
         self.assertTrue(output.exists())
         with open(output) as fh:
             content = fh.read()
-        output.unlink()
+        
         for entry in [
             rf"drwx------ .* {self.src}",
-            rf"drwxrwxr-x .* {self.src}/dir1",
+            rf"drwxr-xr-x .* {self.src}/dir1",
             rf"lrwxrwxrwx .* {self.src}/dir1/symlink1",
-            rf"-rw-rw-r-- .* {self.src}/dir1/file4",
+            rf"-rw-r--r-- .* {self.src}/dir1/file4",
             rf"lrwxrwxrwx .* {self.src}/symlink2",
-            rf"-rw-rw-r-- .* {self.src}/file1",
-            rf"-rw-rw-r-- .* {self.src}/file2",
-            rf"-rw-rw-r-- .* {self.src}/file3",
-            rf"-rw-rw-r-- .* {self.src}/hardlink3",
+            rf"-rw-r--r-- .* {self.src}/file1",
+            rf"-rw-r--r-- .* {self.src}/file2",
+            rf"-rw-r--r-- .* {self.src}/file3",
+            rf"-rw-r--r-- .* {self.src}/hardlink3",
         ]:
             self.assertRegex(content, entry)
 
