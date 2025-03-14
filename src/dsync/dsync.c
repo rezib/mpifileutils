@@ -1205,10 +1205,6 @@ static int dsync_strmap_compare_lite(
         if ((src_size != dst_size) ||
             (src_mtime != dst_mtime) || (comp_mtime_nsec ? (src_mtime_nsec != dst_mtime_nsec):false))
         {
-            MFU_LOG(MFU_LOG_INFO, "Content lite differs files %s and %s (%lu/%lu) (%lu/%lu) (%lu/%lu)",
-                    mfu_flist_file_get_name(src_compare_list, idx),
-                    mfu_flist_file_get_name(dst_compare_list, idx),
-                    src_size, dst_size, src_mtime, dst_mtime, src_mtime_nsec, dst_mtime_nsec);
             /* update to say contents of the files were found to be different */
             dsync_strmap_item_update(src_map, name, DCMPF_CONTENT, DCMPS_DIFFER);
             dsync_strmap_item_update(dst_map, name, DCMPF_CONTENT, DCMPS_DIFFER);
@@ -1611,7 +1607,6 @@ static int dsync_strmap_gc_dst_hardlinks(
     int local_removed_refs = 0;
     uint64_t remove_count = mfu_flist_size(dst_remove_list);
     for(uint64_t idx=0; idx<remove_count; idx++) {
-        MFU_LOG(MFU_LOG_INFO, "rank: %d file %s is marked to be removed", rank, mfu_flist_file_get_name(dst_remove_list, idx));
         // Communicate with all tasks to remove hardlinks
         mfu_filetype type = mfu_flist_file_get_type(dst_remove_list, idx);
         uint64_t nlink = mfu_flist_file_get_nlink(dst_remove_list, idx);
@@ -1639,12 +1634,6 @@ static int dsync_strmap_gc_dst_hardlinks(
         allbytes += (size_t) recvcounts[i];
     }
 
-    MFU_LOG(MFU_LOG_INFO, "rank: %d local_removed_refs: %d", rank, local_removed_refs);
-    if(rank == 0) {
-        MFU_LOG(MFU_LOG_INFO, "rank: %d chars: %lu", rank, chars);
-        MFU_LOG(MFU_LOG_INFO, "rank: %d allbytes: %d", rank, allbytes);
-    }
-
     /* allocate memory for recv buffers */
     char* recvbuf = MFU_MALLOC(allbytes);
     void* sendbuf = NULL;
@@ -1670,8 +1659,6 @@ static int dsync_strmap_gc_dst_hardlinks(
     for (int i = 0; i < (int) ranks; i++) {
         for (int j = 0; j<recvcounts[i]/chars; j++) {
             const char* removed_ref = recvptr;
-            MFU_LOG(MFU_LOG_INFO, "rank: %d receive reference %s marked to be removed", rank, removed_ref);
-
             /* Search for local hardlinks with this reference and mark them to be removed */
             const strmap_node* node;
             strmap_foreach(dst_map, node) {
@@ -1690,7 +1677,6 @@ static int dsync_strmap_gc_dst_hardlinks(
                     tmp_rc = dsync_strmap_item_state(dst_map, key, DCMPF_TYPE, &state);
                     assert(tmp_rc == 0);
                     if (state == DCMPS_COMMON) {
-                        MFU_LOG(MFU_LOG_INFO, "rank: %d hardlink: %s must be removed because reference is removed (state: %d)", rank, mfu_flist_file_get_name(dst_list, dst_index), state);
                         dsync_strmap_item_update(src_map, key, DCMPF_CONTENT, DCMPS_DIFFER);
                         dsync_strmap_item_update(dst_map, key, DCMPF_CONTENT, DCMPS_DIFFER);
                         if (!options.dry_run) {
@@ -1712,7 +1698,7 @@ static int dsync_strmap_gc_dst_hardlinks(
     mfu_free(&sendbuf);
     mfu_free(&recvbuf);
 
-    return 0;
+    return 0; // FIXME: report errors
 
 }
 
