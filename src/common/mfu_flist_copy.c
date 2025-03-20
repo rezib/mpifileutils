@@ -1644,6 +1644,7 @@ static int mfu_create_hardlinks_dest(
     return rc;
 }
 
+/* tracks number of hardlinks created by this process */
 static uint64_t hardlinks_total_count;
 
 /* progress message to print while creating files */
@@ -2622,7 +2623,7 @@ int mfu_flist_copy(
                 mfu_flist* lists2;
                 mfu_flist_array_by_depth(spreadlist, &levels2, &minlevel2, &lists2);
 
-                /* create files and links */
+                /* create files and symlinks */
                 tmp_rc = mfu_create_files(levels2, minlevel2, lists2, numpaths,
                         paths, destpath, copy_opts, mfu_src_file, mfu_dst_file);
                 if (tmp_rc < 0) {
@@ -2765,7 +2766,8 @@ int mfu_flist_copy(
     }
 
     /* create hardlinks */
-    tmp_rc = mfu_create_hardlinks(src_cp_list, numpaths, paths, destpath, copy_opts, mfu_src_file, mfu_dst_file);
+    tmp_rc = mfu_create_hardlinks(src_cp_list, numpaths, paths, destpath,
+        copy_opts, mfu_src_file, mfu_dst_file);
     if (tmp_rc < 0) {
         rc = -1;
     }
