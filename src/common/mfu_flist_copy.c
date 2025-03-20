@@ -1765,7 +1765,8 @@ static int mfu_create_hardlinks(
 
     /* get total for print percent progress while creating */
     hardlinks_total_count = 0;
-    MPI_Allreduce(&hardlinks_local_count, &hardlinks_total_count, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(&hardlinks_local_count, &hardlinks_total_count, 1,
+        MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
 
     /* bail early if there is no work to do */
     if (hardlinks_total_count == 0) {
@@ -1778,7 +1779,8 @@ static int mfu_create_hardlinks(
     }
 
     /* start progress messages for creating files */
-    mfu_progress* create_prog = mfu_progress_start(mfu_progress_timeout, 1, MPI_COMM_WORLD, create_hardlinks_progress_fn);
+    mfu_progress* create_prog = mfu_progress_start(mfu_progress_timeout, 1,
+        MPI_COMM_WORLD, create_hardlinks_progress_fn);
 
     uint64_t total_count = 0;
 
