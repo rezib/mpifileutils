@@ -1581,7 +1581,11 @@ static int dsync_strmap_compare_link_dest(
     return rc;
 }
 
-static int dsync_strmap_gc_dst_hardlinks(
+/* For all local references files (ie. regular files with nlink > 1), flag all
+ * hardlinks using these files as references as having different content and
+ * place them in destination removal list and source copy list. Return -1 on
+ * error on any task. */
+static int dsync_remove_hardlinks_with_removed_refs(
     mfu_flist src_list,
     mfu_flist src_cp_list,
     strmap* src_map,
@@ -1591,7 +1595,10 @@ static int dsync_strmap_gc_dst_hardlinks(
     mfu_file_t* mfu_src_file,
     mfu_file_t* mfu_dst_file
 ) {
-    // AllGatherv all references that are going to be removed
+    /* assume we'll succeed */
+    int rc = 0;
+    int tmp_rc;
+
     uint64_t chars = mfu_flist_file_max_name(dst_remove_list);
 
     /* bail out if there is nothing removed in destination */
@@ -1599,26 +1606,22 @@ static int dsync_strmap_gc_dst_hardlinks(
         return 0;
     }
 
-    int rank, ranks;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    int ranks;
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
 
-    /* Count all local references that will be removed */
+    /* count all local references (ie. files with nlink > 1) selected for removal */
     int local_removed_refs = 0;
     uint64_t remove_count = mfu_flist_size(dst_remove_list);
     for(uint64_t idx=0; idx<remove_count; idx++) {
-        // Communicate with all tasks to remove hardlinks
         mfu_filetype type = mfu_flist_file_get_type(dst_remove_list, idx);
         uint64_t nlink = mfu_flist_file_get_nlink(dst_remove_list, idx);
-
-        if (type == MFU_TYPE_FILE && nlink>1) {
+        if (type == MFU_TYPE_FILE && nlink > 1) {
             local_removed_refs++;
         }
     }
 
-    /* allgather to get bytes on each process */
+    /* get number of references removed by all tasks */
     int* recvcounts = (int*) MFU_MALLOC(ranks * sizeof(int));
-    int* recvdispls = (int*) MFU_MALLOC(ranks * sizeof(int));
     MPI_Allgather(&local_removed_refs, 1, MPI_INT, recvcounts, 1, MPI_INT, MPI_COMM_WORLD);
 
     MPI_Aint char_lb, char_extent;
@@ -1627,7 +1630,10 @@ static int dsync_strmap_gc_dst_hardlinks(
     /* compute displacements and total number of bytes that we'll receive */
     size_t allbytes = 0;
     int disp = 0;
+    int* recvdispls = (int*) MFU_MALLOC(ranks * sizeof(int));
+
     for (int i = 0; i < (int) ranks; i++) {
+        /* adjust values in recvcounts for MPI_Allgatherv() */
         recvcounts[i] *= chars;
         recvdispls[i] = disp;
         disp += (int) recvcounts[i];
@@ -1638,6 +1644,7 @@ static int dsync_strmap_gc_dst_hardlinks(
     char* recvbuf = MFU_MALLOC(allbytes);
     void* sendbuf = NULL;
 
+    /* fill sendbuf with names of local references that will be removed */
     if (local_removed_refs) {
         sendbuf = MFU_MALLOC((size_t)char_extent * chars * local_removed_refs);
         char* sendptr = (char*) sendbuf;
@@ -1654,52 +1661,78 @@ static int dsync_strmap_gc_dst_hardlinks(
 
     MPI_Allgatherv(sendbuf, local_removed_refs * chars, MPI_CHAR, recvbuf, recvcounts, recvdispls, MPI_CHAR, MPI_COMM_WORLD);
 
+    /* iterate of all reference names received */
     uint64_t count = mfu_flist_size(dst_list);
     char* recvptr = (char*) recvbuf;
     for (int i = 0; i < (int) ranks; i++) {
-        for (int j = 0; j<recvcounts[i]/chars; j++) {
+        for (int j = 0; j<recvcounts[i]; j++) {
             const char* removed_ref = recvptr;
-            /* Search for local hardlinks with this reference and mark them to be removed */
+            /* search for local hardlinks with this reference and mark them to be removed */
             const strmap_node* node;
             strmap_foreach(dst_map, node) {
                 /* get file name */
                 const char* key = strmap_node_key(node);
+
                 /* get index of destination file */
                 uint64_t dst_index;
                 int tmp_rc;
                 tmp_rc = dsync_strmap_item_index(dst_map, key, &dst_index);
-                assert(tmp_rc == 0);
+                if (tmp_rc) {
+                    rc = -1;
+                    MFU_LOG(MFU_LOG_ERR, "ERROR: Unable to find index of key `%s' in source map", key);
+                    continue;
+                }
 
+                /* skip item if not hardlink */
                 mfu_filetype type = mfu_flist_file_get_type(dst_list, dst_index);
-                const char *ref = mfu_flist_file_get_ref(dst_list, dst_index);
-                if(type == MFU_TYPE_HARDLINK && !strcmp(ref, removed_ref)) {
-                    dsync_state state;
-                    tmp_rc = dsync_strmap_item_state(dst_map, key, DCMPF_TYPE, &state);
-                    assert(tmp_rc == 0);
-                    if (state == DCMPS_COMMON) {
-                        dsync_strmap_item_update(src_map, key, DCMPF_CONTENT, DCMPS_DIFFER);
-                        dsync_strmap_item_update(dst_map, key, DCMPF_CONTENT, DCMPS_DIFFER);
-                        if (!options.dry_run) {
-                            /* get index of source file */
-                            uint64_t src_index;
-                            tmp_rc = dsync_strmap_item_index(src_map, key, &src_index);
-                            if(!tmp_rc)
-                                mfu_flist_file_copy(src_list, src_index, src_cp_list);
-                            mfu_flist_file_copy(dst_list, dst_index, dst_remove_list);
-                        }
-                    }
+                if(type != MFU_TYPE_HARDLINK)
+                    continue;
 
+                /* skip item if reference does not match */
+                const char *ref = mfu_flist_file_get_ref(dst_list, dst_index);
+                if(strcmp(ref, removed_ref))
+                    continue;
+
+                /* skip item if type already differs */
+                dsync_state state;
+                tmp_rc = dsync_strmap_item_state(dst_map, key, DCMPF_TYPE, &state);
+                assert(tmp_rc == 0);
+                if (state == DCMPS_DIFFER)
+                    continue;
+
+                /* update to say contents of the symlinks were found to be different */
+                dsync_strmap_item_update(src_map, key, DCMPF_CONTENT, DCMPS_DIFFER);
+                dsync_strmap_item_update(dst_map, key, DCMPF_CONTENT, DCMPS_DIFFER);
+
+                /* Unless dry run mode, mark the file to be removed in destination and
+                 * copied from source. */
+                if (!options.dry_run) {
+                    /* get index of source file */
+                    uint64_t src_index;
+                    tmp_rc = dsync_strmap_item_index(src_map, key, &src_index);
+                    if (tmp_rc) {
+                        rc = -1;
+                        MFU_LOG(MFU_LOG_ERR, "ERROR: Unable to find index of key `%s' in destination map", key);
+                    } else
+                        mfu_flist_file_copy(src_list, src_index, src_cp_list);
+                    mfu_flist_file_copy(dst_list, dst_index, dst_remove_list);
                 }
             }
-            recvptr += char_extent * chars;;
+            /* jump to next received path */
+            recvptr += char_extent * chars;
         }
     }
 
     mfu_free(&sendbuf);
     mfu_free(&recvbuf);
 
-    return 0; // FIXME: report errors
+    /* determine whether any process hit an error,
+     * input is either 0 or -1, so MIN will return -1 if any */
+    int all_rc;
+    MPI_Allreduce(&rc, &all_rc, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    rc = all_rc;
 
+    return rc;
 }
 
 /* compare entries from src into dst */
@@ -2016,8 +2049,10 @@ static int dsync_strmap_compare(
 
     mfu_flist_summarize(dst_remove_list);
 
-    // For all files in dst_remove_list, remove all hardlinks pointing to this reference
-    tmp_rc = dsync_strmap_gc_dst_hardlinks(src_list, src_cp_list, src_map, dst_list, dst_remove_list, dst_map, mfu_src_file, mfu_dst_file);
+    /* For all references (ie. regular files with nlink > 1) in dst_remove_list,
+     * select all hardlinks pointing to this reference for removal as well. */
+    tmp_rc = dsync_remove_hardlinks_with_removed_refs(src_list, src_cp_list,
+        src_map, dst_list, dst_remove_list, dst_map, mfu_src_file, mfu_dst_file);
     if (tmp_rc < 0) {
         rc = -1;
     }
