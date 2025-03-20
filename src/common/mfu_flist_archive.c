@@ -5114,8 +5114,8 @@ static int extract_files(
 }
 
 /* iterate through our portion of the given file list,
- * identify symlinks and extract them from archive */
-static int extract_symlinks(
+ * identify symlinks and hardlinks and extract them from archive */
+static int extract_links(
     const char* filename,     /* name of archive file */
     mfu_flist flist,          /* file list of items */
     uint64_t* offsets,        /* offset of each item in the archive */
@@ -5123,31 +5123,37 @@ static int extract_symlinks(
 {
     int rc = MFU_SUCCESS;
 
-    /* iterate over all items in our list and count symlinks */
-    uint64_t count = 0;
+    /* iterate over all items in our list, count symlinks and hardlinks */
+    uint64_t count_symlinks = 0, count_hardlinks = 0;
     uint64_t idx;
     uint64_t size = mfu_flist_size(flist);
     for (idx = 0; idx < size; idx++) {
         mfu_filetype type = mfu_flist_file_get_type(flist, idx);
         if (type == MFU_TYPE_LINK) {
             /* found a symlink */
-            count++;
+            count_symlinks++;
+        }
+        if (type == MFU_TYPE_HARDLINK) {
+            /* found a hardlink */
+            count_hardlinks++;
         }
     }
 
     /* count total number of links */
-    uint64_t all_count;
-    MPI_Allreduce(&count, &all_count, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+    uint64_t all_count_symlinks, all_count_hardlinks;
+    MPI_Allreduce(&count_symlinks, &all_count_symlinks, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(&count_hardlinks, &all_count_hardlinks, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
 
     /* bail out early if there is nothing to do */
-    if (all_count == 0) {
+    if (all_count_symlinks + all_count_hardlinks == 0) {
         return MFU_SUCCESS;
     }
 
     /* let user know what we're doing */
     MPI_Barrier(MPI_COMM_WORLD);
     if (mfu_rank == 0) {
-        MFU_LOG(MFU_LOG_INFO, "Creating %llu symlinks", (unsigned long long)all_count);
+        MFU_LOG(MFU_LOG_INFO, "Creating %llu symlinks", (unsigned long long)all_count_symlinks);
+        MFU_LOG(MFU_LOG_INFO, "Creating %llu hardlinks", (unsigned long long)all_count_hardlinks);
     }
 
     /* open the archive file for reading */
@@ -5175,10 +5181,14 @@ static int extract_symlinks(
     for (idx = 0; idx < size; idx++) {
         /* skip entries that are not symlinks */
         mfu_filetype type = mfu_flist_file_get_type(flist, idx);
-        if (type != MFU_TYPE_LINK) {
-            /* not a symlink, go to next item */
+        char* type_s;
+        if (type == MFU_TYPE_LINK) {
+            type_s = "symlink";
+        } else if (type == MFU_TYPE_HARDLINK) {
+            type_s = "hardlink";
+        } else
+            /* not a symlink or hardlink, go to next item */
             continue;
-        }
 
         /* got a symlink, get its path */
         const char* name = mfu_flist_file_get_name(flist, idx);
@@ -5207,8 +5217,8 @@ static int extract_symlinks(
         /* use a small read block size, since we just need the header */
         int r = archive_read_open_fd(a, fd, 10240);
         if (r != ARCHIVE_OK) {
-            MFU_LOG(MFU_LOG_ERR, "opening archive to extract symlink `%s' at offset %llu %s",
-                name, offset, archive_error_string(a)
+            MFU_LOG(MFU_LOG_ERR, "opening archive to extract %s `%s' at offset %llu %s",
+                type_s, name, offset, archive_error_string(a)
             );
             archive_read_free(a);
             rc = MFU_FAILURE;
@@ -5219,8 +5229,8 @@ static int extract_symlinks(
         struct archive_entry* entry;
         r = archive_read_next_header(a, &entry);
         if (r == ARCHIVE_EOF) {
-            MFU_LOG(MFU_LOG_ERR, "Unexpected end of archive while extracting symlink `%s' at offset %llu",
-                name, offset
+            MFU_LOG(MFU_LOG_ERR, "Unexpected end of archive while extracting %s `%s' at offset %llu",
+                type_s, name, offset
             );
             archive_read_close(a);
             archive_read_free(a);
@@ -5228,8 +5238,8 @@ static int extract_symlinks(
             continue;
         }
         if (r != ARCHIVE_OK) {
-            MFU_LOG(MFU_LOG_ERR, "Extracting symlink '%s' at offset %llu %s",
-                name, offset, archive_error_string(a)
+            MFU_LOG(MFU_LOG_ERR, "Extracting %s '%s' at offset %llu %s",
+                type_s, name, offset, archive_error_string(a)
             );
             archive_read_close(a);
             archive_read_free(a);
@@ -5237,217 +5247,66 @@ static int extract_symlinks(
             continue;
         }
 
-        /* get target of the link */
-        const char* target = archive_entry_symlink(entry);
-        if (target == NULL) {
-            MFU_LOG(MFU_LOG_ERR, "Item is not a symlink as expected `%s'",
-                name);
-            archive_read_close(a);
-            archive_read_free(a);
-            rc = MFU_FAILURE;
-            continue;
-        }
-
-        /* create the link on the file system */
-        int symlink_rc = mfu_symlink(target, name);
-        if (symlink_rc != 0) {
-            /* TODO: check whether user wants overwrite */
-            if (errno == EEXIST) {
-                /* failed because something exists,
-                 * attempt to delete item and try again */
-                mfu_unlink(name);
-                symlink_rc = mfu_symlink(target, name);
+        if (type == MFU_TYPE_LINK) {
+            /* get target of the symlink */
+            const char* target = archive_entry_symlink(entry);
+            if (target == NULL) {
+                MFU_LOG(MFU_LOG_ERR, "Item is not a symlink as expected `%s'",
+                    name);
+                archive_read_close(a);
+                archive_read_free(a);
+                rc = MFU_FAILURE;
+                continue;
             }
-
-            /* if we still failed, give up */
+            /* create the symlink on the file system */
+            int symlink_rc = mfu_symlink(target, name);
             if (symlink_rc != 0) {
-                MFU_LOG(MFU_LOG_ERR, "Failed to set symlink `%s' (errno=%d %s)",
-                    name, errno, strerror(errno));
-                rc = MFU_FAILURE;
+                /* TODO: check whether user wants overwrite */
+                if (errno == EEXIST) {
+                    /* failed because something exists,
+                    * attempt to delete item and try again */
+                    mfu_unlink(name);
+                    symlink_rc = mfu_symlink(target, name);
+                }
+
+                /* if we still failed, give up */
+                if (symlink_rc != 0) {
+                    MFU_LOG(MFU_LOG_ERR, "Failed to set symlink `%s' (errno=%d %s)",
+                        name, errno, strerror(errno));
+                    rc = MFU_FAILURE;
+                }
             }
         }
 
-        /* close out the read archive object */
-        r = archive_read_close(a);
-        if (r != ARCHIVE_OK) {
-            MFU_LOG(MFU_LOG_ERR, "Failed to close read archive %s",
-                archive_error_string(a)
-            );
-            rc = MFU_FAILURE;
-        }
-
-        /* free memory allocated in read archive object */
-        r = archive_read_free(a);
-        if (r != ARCHIVE_OK) {
-            MFU_LOG(MFU_LOG_ERR, "Failed to free read archive %s",
-                archive_error_string(a)
-            );
-            rc = MFU_FAILURE;
-        }
-    }
-
-    /* close the archive file */
-    mfu_close(filename, fd);
-
-    /* figure out whether anyone failed */
-    if (! mfu_alltrue(rc == MFU_SUCCESS, MPI_COMM_WORLD)) {
-        rc = MFU_FAILURE;
-    }
-
-    return rc;
-}
-
-/* iterate through our portion of the given file list,
- * identify hardlinks and extract them from archive */
- static int extract_hardlinks(
-    const char* filename,     /* name of archive file */
-    mfu_flist flist,          /* file list of items */
-    uint64_t* offsets,        /* offset of each item in the archive */
-    mfu_archive_opts_t* opts) /* options to configure extraction operation */
-{
-    int rc = MFU_SUCCESS;
-
-    /* iterate over all items in our list and count hardlinks */
-    uint64_t count = 0;
-    uint64_t idx;
-    uint64_t size = mfu_flist_size(flist);
-    for (idx = 0; idx < size; idx++) {
-        mfu_filetype type = mfu_flist_file_get_type(flist, idx);
         if (type == MFU_TYPE_HARDLINK) {
-            /* found a hardlink */
-            count++;
-        }
-    }
-
-    /* count total number of links */
-    uint64_t all_count;
-    MPI_Allreduce(&count, &all_count, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
-
-    /* bail out early if there is nothing to do */
-    if (all_count == 0) {
-        return MFU_SUCCESS;
-    }
-
-    /* let user know what we're doing */
-    MPI_Barrier(MPI_COMM_WORLD);
-    if (mfu_rank == 0) {
-        MFU_LOG(MFU_LOG_INFO, "Creating %llu hardlinks", (unsigned long long)all_count);
-    }
-
-    /* open the archive file for reading */
-    int fd = mfu_open(filename, O_RDONLY);
-    if (fd < 0) {
-        MFU_LOG(MFU_LOG_ERR, "Failed to open archive: '%s' errno=%d %s",
-            filename, errno, strerror(errno)
-        );
-        rc = MFU_FAILURE;
-    }
-
-    /* check that everyone opened the archive successfully */
-    if (! mfu_alltrue(rc == MFU_SUCCESS, MPI_COMM_WORLD)) {
-        /* someone failed, close the file if we opened it and return */
-        if (fd >= 0) {
-            mfu_close(filename, fd);
-        }
-        return MFU_FAILURE;
-    }
-
-    /* get global offset of our portion of the list */
-    uint64_t global_offset = mfu_flist_global_offset(flist);
-
-    /* iterate over all items in our list and create any hardlinks */
-    for (idx = 0; idx < size; idx++) {
-        /* skip entries that are not hardlinks */
-        mfu_filetype type = mfu_flist_file_get_type(flist, idx);
-        if (type != MFU_TYPE_HARDLINK) {
-            /* not a hardlink, go to next item */
-            continue;
-        }
-
-        /* got a symlink, get its path */
-        const char* name = mfu_flist_file_get_name(flist, idx);
-
-        /* seek to start of the corresponding entry in the archive file */
-        uint64_t global_idx = global_offset + idx;
-        off_t offset = (off_t) offsets[global_idx];
-        off_t pos = mfu_lseek(filename, fd, offset, SEEK_SET);
-        if (pos == (off_t)-1) {
-            MFU_LOG(MFU_LOG_ERR, "Failed to seek to offset %llu in open archive: '%s' errno=%d %s",
-                offset, filename, errno, strerror(errno)
-            );
-            rc = MFU_FAILURE;
-            continue;
-        }
-
-        /* initiate archive object for reading */
-        struct archive* a = archive_read_new();
-
-        /* when using offsets, we assume there is no compression */
-//        archive_read_support_filter_bzip2(a);
-//        archive_read_support_filter_gzip(a);
-//        archive_read_support_filter_compress(a);
-        archive_read_support_format_tar(a);
-
-        /* use a small read block size, since we just need the header */
-        int r = archive_read_open_fd(a, fd, 10240);
-        if (r != ARCHIVE_OK) {
-            MFU_LOG(MFU_LOG_ERR, "opening archive to extract hardlink `%s' at offset %llu %s",
-                name, offset, archive_error_string(a)
-            );
-            archive_read_free(a);
-            rc = MFU_FAILURE;
-            continue;
-        }
-
-        /* read the entry header for this item */
-        struct archive_entry* entry;
-        r = archive_read_next_header(a, &entry);
-        if (r == ARCHIVE_EOF) {
-            MFU_LOG(MFU_LOG_ERR, "Unexpected end of archive while extracting hardlink `%s' at offset %llu",
-                name, offset
-            );
-            archive_read_close(a);
-            archive_read_free(a);
-            rc = MFU_FAILURE;
-            continue;
-        }
-        if (r != ARCHIVE_OK) {
-            MFU_LOG(MFU_LOG_ERR, "Extracting hardlink '%s' at offset %llu %s",
-                name, offset, archive_error_string(a)
-            );
-            archive_read_close(a);
-            archive_read_free(a);
-            rc = MFU_FAILURE;
-            continue;
-        }
-
-        /* get target of the link */
-        const char* target = archive_entry_hardlink(entry);
-        if (target == NULL) {
-            MFU_LOG(MFU_LOG_ERR, "Item is not a hardlink as expected `%s'",
-                name);
-            archive_read_close(a);
-            archive_read_free(a);
-            rc = MFU_FAILURE;
-            continue;
-        }
-
-        /* create the link on the file system */
-        int hardlink_rc = mfu_hardlink(target, name);
-        if (hardlink_rc != 0) {
-            /* TODO: check whether user wants overwrite */
-            if (errno == EEXIST) {
-                /* failed because something exists,
-                 * attempt to delete item and try again */
-                mfu_unlink(name);
-                hardlink_rc = mfu_hardlink(target, name);
+            /* get target of the hardlink */
+            const char* target = archive_entry_hardlink(entry);
+            if (target == NULL) {
+                MFU_LOG(MFU_LOG_ERR, "Item is not a hardlink as expected `%s'",
+                    name);
+                archive_read_close(a);
+                archive_read_free(a);
+                rc = MFU_FAILURE;
+                continue;
             }
 
-            /* if we still failed, give up */
+            /* create the hardlink on the file system */
+            int hardlink_rc = mfu_hardlink(target, name);
             if (hardlink_rc != 0) {
-                MFU_LOG(MFU_LOG_ERR, "Failed to set hardlink `%s' (errno=%d %s)",
-                    name, errno, strerror(errno));
-                rc = MFU_FAILURE;
+                /* TODO: check whether user wants overwrite */
+                if (errno == EEXIST) {
+                    /* failed because something exists,
+                    * attempt to delete item and try again */
+                    mfu_unlink(name);
+                    hardlink_rc = mfu_hardlink(target, name);
+                }
+
+                /* if we still failed, give up */
+                if (hardlink_rc != 0) {
+                    MFU_LOG(MFU_LOG_ERR, "Failed to set hardlink `%s' (errno=%d %s)",
+                        name, errno, strerror(errno));
+                    rc = MFU_FAILURE;
+                }
             }
         }
 
@@ -5945,17 +5804,10 @@ int mfu_flist_archive_extract(
              * create the files in advance */
             mfu_flist_mknod(flist, create_opts);
 
-            /* create symlinks */
-            int tmp_rc = extract_symlinks(filename, flist, offsets, opts);
+            /* create symlinks and hardlinks */
+            int tmp_rc = extract_links(filename, flist, offsets, opts);
             if (tmp_rc != MFU_SUCCESS) {
                 /* tried but failed to get some symlink, so mark as failure */
-                ret = tmp_rc;
-            }
-
-            /* create hardlinks */
-            tmp_rc = extract_hardlinks(filename, flist, offsets, opts);
-            if (tmp_rc != MFU_SUCCESS) {
-                /* tried but failed to get some hardlink, so mark as failure */
                 ret = tmp_rc;
             }
 
