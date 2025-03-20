@@ -1609,7 +1609,7 @@ static int dsync_remove_hardlinks_with_removed_refs(
     int ranks;
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
 
-    /* count all local references (ie. files with nlink > 1) selected for removal */
+    /* Count all local references selected for removal. */
     int local_removed_refs = 0;
     uint64_t remove_count = mfu_flist_size(dst_remove_list);
     for(uint64_t idx=0; idx<remove_count; idx++) {
@@ -1622,7 +1622,8 @@ static int dsync_remove_hardlinks_with_removed_refs(
 
     /* get number of references removed by all tasks */
     int* recvcounts = (int*) MFU_MALLOC(ranks * sizeof(int));
-    MPI_Allgather(&local_removed_refs, 1, MPI_INT, recvcounts, 1, MPI_INT, MPI_COMM_WORLD);
+    MPI_Allgather(&local_removed_refs, 1, MPI_INT,
+        recvcounts, 1, MPI_INT, MPI_COMM_WORLD);
 
     MPI_Aint char_lb, char_extent;
     MPI_Type_get_extent(MPI_CHAR, &char_lb, &char_extent);
@@ -1659,7 +1660,8 @@ static int dsync_remove_hardlinks_with_removed_refs(
         }
     }
 
-    MPI_Allgatherv(sendbuf, local_removed_refs * chars, MPI_CHAR, recvbuf, recvcounts, recvdispls, MPI_CHAR, MPI_COMM_WORLD);
+    MPI_Allgatherv(sendbuf, local_removed_refs * chars, MPI_CHAR,
+        recvbuf, recvcounts, recvdispls, MPI_CHAR, MPI_COMM_WORLD);
 
     /* iterate of all reference names received */
     uint64_t count = mfu_flist_size(dst_list);
@@ -1667,7 +1669,8 @@ static int dsync_remove_hardlinks_with_removed_refs(
     for (int i = 0; i < (int) ranks; i++) {
         for (int j = 0; j<recvcounts[i]; j++) {
             const char* removed_ref = recvptr;
-            /* search for local hardlinks with this reference and mark them to be removed */
+            /* Search for local hardlinks with this reference and mark them to
+             * be removed. */
             const strmap_node* node;
             strmap_foreach(dst_map, node) {
                 /* get file name */
@@ -1700,12 +1703,13 @@ static int dsync_remove_hardlinks_with_removed_refs(
                 if (state == DCMPS_DIFFER)
                     continue;
 
-                /* update to say contents of the symlinks were found to be different */
+                /* Update to say contents of the symlinks were found to be
+                 * different */
                 dsync_strmap_item_update(src_map, key, DCMPF_CONTENT, DCMPS_DIFFER);
                 dsync_strmap_item_update(dst_map, key, DCMPF_CONTENT, DCMPS_DIFFER);
 
-                /* Unless dry run mode, mark the file to be removed in destination and
-                 * copied from source. */
+                /* Unless dry run mode, mark the file to be removed in
+                 * destination and copied from source. */
                 if (!options.dry_run) {
                     /* get index of source file */
                     uint64_t src_index;
@@ -1723,6 +1727,8 @@ static int dsync_remove_hardlinks_with_removed_refs(
         }
     }
 
+    mfu_free(&recvcounts);
+    mfu_free(&recvdispls);
     mfu_free(&sendbuf);
     mfu_free(&recvbuf);
 
@@ -1836,8 +1842,6 @@ static int dsync_strmap_compare(
         dsync_strmap_item_update(src_map, key, DCMPF_EXIST, DCMPS_COMMON);
         dsync_strmap_item_update(dst_map, key, DCMPF_EXIST, DCMPS_COMMON);
 
-        //MFU_LOG(MFU_LOG_INFO, "Comparing files %s and %s", mfu_flist_file_get_name(src_list, src_index), mfu_flist_file_get_name(dst_list, dst_index));
-
         tmp_rc = dsync_compare_metadata(src_list, src_map, src_index,
              dst_list, dst_map, dst_index,
              key);
@@ -1870,8 +1874,6 @@ static int dsync_strmap_compare(
 
         mfu_filetype src_type = mfu_flist_file_get_type(src_list, src_index);
         mfu_filetype dst_type = mfu_flist_file_get_type(dst_list, dst_index);
-
-        //MFU_LOG(MFU_LOG_INFO, "Comparing type files %s and %s", mfu_flist_file_get_name(src_list, src_index), mfu_flist_file_get_name(dst_list, dst_index));
 
         /* check whether files are of the same type */
         if (src_type != dst_type) {
