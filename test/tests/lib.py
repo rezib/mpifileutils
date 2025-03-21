@@ -5,6 +5,7 @@ import dataclasses
 from pathlib import Path
 import tempfile
 import os
+import stat
 import subprocess
 import typing as t
 import shlex
@@ -59,10 +60,21 @@ def create_file(path: Path):
     fh.close()
 
 
+# Global variables holding the real dataclasses instanciated in tests for
+# comparisons.
+RegularFile = None
+Symlink = None
+Directory = None
+
+
 @dataclasses.dataclass
 class FilesystemObject:
     parent: Path = dataclasses.field(compare=False)
     name: str
+    mode: int
+    uid: int
+    gid: int
+    mtime: int
 
     @property
     def path(self) -> Path:
@@ -74,31 +86,29 @@ class _RegularFile(FilesystemObject):
     inode: int = dataclasses.field(compare=False)
     nlink: int
     size: int
-    uid: int
-    gid: int
-    mtime: int
 
     def __str__(self):
         return (
             f"File[{self.path} inode:{self.inode} nlink:{self.nlink}, "
-            f"size:{self.size}, uid:{self.uid}, gid:{self.gid}, "
-            f"mtime:{self.mtime}]"
+            f"size:{self.size}, mode: {stat.filemode(self.mode)}, "
+            f"uid:{self.uid}, gid:{self.gid}, mtime:{self.mtime}]"
         )
 
 
-RegularFile = None
-
-
 @dataclasses.dataclass
-class Symlink(FilesystemObject):
+class _Symlink(FilesystemObject):
     target: str
 
     def __str__(self):
-        return f"Symlink[{self.path}→{self.target}]"
+        return (
+            f"Symlink[{self.path}→{self.target} "
+            f"mode: {stat.filemode(self.mode)}, "
+            f"uid:{self.uid}, gid:{self.gid}, mtime:{self.mtime}]"
+        )
 
 
 @dataclasses.dataclass
-class Directory(FilesystemObject):
+class _Directory(FilesystemObject):
     content: dict = dataclasses.field(default_factory=dict)
 
     def get(self, path: str):
@@ -109,7 +119,11 @@ class Directory(FilesystemObject):
         return value.get(components[-1])
 
     def __str__(self):
-        return f"Directory[{self.path}]"
+        return (
+            f"Directory[{self.path} "
+            f"mode: {stat.filemode(self.mode)}, "
+            f"uid:{self.uid}, gid:{self.gid}, mtime:{self.mtime}]"
+        )
 
     def dump(self, indent=0):
         if not self.content:
@@ -121,29 +135,46 @@ class Directory(FilesystemObject):
 
     @classmethod
     def from_path(cls, path: Path):
-        dir_o = cls(path.parent, path.name)
+        fs_o_stat = path.stat()
+        dir_o = cls(
+            path.parent,
+            path.name,
+            fs_o_stat.st_mode,
+            fs_o_stat.st_uid,
+            fs_o_stat.st_gid,
+            fs_o_stat.st_mtime,
+        )
         for item in Path(path).iterdir():
+            fs_o_stat = item.stat()
             if item.is_symlink():
-                fs_o = Symlink(dir_o.path, item.name, str(item.readlink()))
-            elif item.is_dir():
-                fs_o = Directory.from_path(item)
-            else:
-                fs_o_stat = item.stat()
-                fs_o = RegularFile(
+                fs_o = Symlink(
                     dir_o.path,
                     item.name,
-                    fs_o_stat.st_ino,
-                    fs_o_stat.st_nlink,
-                    fs_o_stat.st_size,
+                    fs_o_stat.st_mode,
                     fs_o_stat.st_uid,
                     fs_o_stat.st_gid,
                     fs_o_stat.st_mtime,
+                    str(item.readlink()),
+                )
+            elif item.is_dir():
+                fs_o = Directory.from_path(item)
+            else:
+                fs_o = RegularFile(
+                    dir_o.path,
+                    item.name,
+                    fs_o_stat.st_mode,
+                    fs_o_stat.st_uid,
+                    fs_o_stat.st_gid,
+                    fs_o_stat.st_mtime,
+                    fs_o_stat.st_ino,
+                    fs_o_stat.st_nlink,
+                    fs_o_stat.st_size,
                 )
             dir_o.content[item.name] = fs_o
         return dir_o
 
 
-class FileTree(Directory):
+class FileTree(_Directory):
 
     def dump(self):
         print(f"\nFile tree {self.path}:")
@@ -291,9 +322,11 @@ class TestFileTreeCmp(unittest.TestCase):
         if dest is None:
             dest = self.dst
         global RegularFile
+        global Symlink
+        global Directory
         if ignore_nlink or ignore_mtime:
-            # Create new dataclass in which nlink or mtime are ignored in __eq__
-            # operator.
+            # Create new dataclasses in which nlink or mtime are ignored in
+            # __eq__  operator.
             RegularFile = dataclasses.make_dataclass(
                 "RegularFile",
                 [
@@ -302,8 +335,25 @@ class TestFileTreeCmp(unittest.TestCase):
                 ],
                 bases=(_RegularFile,),
             )
+            Symlink = dataclasses.make_dataclass(
+                "Symlink",
+                [
+                    ("mtime", int, dataclasses.field(compare=not ignore_mtime)),
+                ],
+                bases=(_Symlink,),
+            )
+            Directory = dataclasses.make_dataclass(
+                "Directory",
+                [
+                    ("mtime", int, dataclasses.field(compare=not ignore_mtime)),
+                ],
+                bases=(_Directory,),
+            )
+
         else:
             RegularFile = _RegularFile
+            Symlink = _Symlink
+            Directory = _Directory
 
         ft_src = FileTree.from_path(self.src)
         ft_dst = FileTree.from_path(dest)

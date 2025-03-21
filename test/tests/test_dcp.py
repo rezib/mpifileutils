@@ -118,6 +118,16 @@ class TestDcpBasic(TestDcp):
         # destination.
         self.assertSrcDstEqual()
 
+    def test_dcp_preserve_chmod(self):
+        # Change some file modes in source
+        (self.src / "file1").chmod(0o400)
+        (self.src / "hardlink3").chmod(0o400)
+        (self.src / "dir1").chmod(0o700)
+        self.run_dcp(preserve=True)
+        # With dcp --preserve, files must have the same metadata in source and
+        # destination.
+        self.assertSrcDstEqual()
+
     def test_dcp_chunksize(self):
         # Add 16MB of data in a file to have multiple chunks
         with open(self.src / "file1", "wb") as fh:

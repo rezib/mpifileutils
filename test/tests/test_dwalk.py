@@ -42,7 +42,7 @@ class TestDwalkBasic(TestDwalk):
         super().setUp()
         oldmask = os.umask(0o022)
         create_basic_layout(self.src)
-        os.umask (oldmask)
+        os.umask(oldmask)
 
     def test_walk(self):
         proc = self.run_dwalk()
@@ -124,7 +124,7 @@ class TestDwalkBasic(TestDwalk):
         self.assertTrue(output.exists())
         with open(output) as fh:
             content = fh.read()
-        
+
         for entry in [
             rf"drwx------ .* {self.src}",
             rf"drwxr-xr-x .* {self.src}/dir1",
