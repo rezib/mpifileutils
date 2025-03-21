@@ -99,6 +99,22 @@ static void DTAR_exit(int code)
     exit(code);
 }
 
+/* append a copy of entry in entries list and move current */
+static void entries_list_add(entry_list_t** entries, entry_list_t** current, struct archive_entry* entry) {
+    entry_list_t* new_entry = (entry_list_t*) malloc(sizeof(entry_list_t));
+    new_entry->entry = archive_entry_clone(entry);
+    new_entry->next = NULL;
+    if(!*entries) {
+        *entries = new_entry;
+    }
+    if(!*current) {
+        *current = new_entry;
+    } else {
+        (*current)->next = new_entry;
+        *current = (*current)->next;
+    }
+}
+
 /****************************************
  * Cache opened files to avoid repeated open/close of
  * the same file when using libcicle
@@ -432,7 +448,6 @@ static int encode_header(
                 flags |= ARCHIVE_READDISK_NO_FFLAGS;
             }
             archive_read_disk_set_behavior(source, flags);
-            MFU_LOG(MFU_LOG_INFO, "archive_read_disk_entry_from_file(): %s", fname);
 
             /* build the entry by querying the item associated with the open
              * file descriptor, on which libarchive calls fstat(). For symlinks,
@@ -4329,22 +4344,6 @@ static uint64_t flist_sum_bytes(mfu_flist flist)
     uint64_t total_bytes;
     MPI_Allreduce(&bytes, &total_bytes, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
     return total_bytes;
-}
-
-/* append a copy of entry in entries list and move current */
-static void entries_list_add(entry_list_t** entries, entry_list_t** current, struct archive_entry* entry) {
-    entry_list_t* new_entry = (entry_list_t*) malloc(sizeof(entry_list_t));
-    new_entry->entry = archive_entry_clone(entry);
-    new_entry->next = NULL;
-    if(!*entries) {
-        *entries = new_entry;
-    }
-    if(!*current) {
-        *current = new_entry;
-    } else {
-        (*current)->next = new_entry;
-        *current = (*current)->next;
-    }
 }
 
 /* Extract items from a given archive file, given the offset of each entry in the archive.
