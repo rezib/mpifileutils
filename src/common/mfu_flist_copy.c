@@ -954,8 +954,6 @@ static int mfu_copy_set_metadata_dirs(
     return rc;
 }
 
-// FIXME: define static int mfu_copy_set_metadata_hardlinks()
-
 /* creates dir in destpath for specified item, identifies source path
  * that contains source dir, computes relative path to dir under source path,
  * and creates dir at same relative path under destpath, optionally copies
@@ -1647,7 +1645,7 @@ static int mfu_create_hardlinks_dest(
 /* tracks number of hardlinks created by this process */
 static uint64_t hardlinks_total_count;
 
-/* progress message to print while creating files */
+/* progress message to print while creating hardlinks */
 static void create_hardlinks_progress_fn(const uint64_t* vals, int count, int complete, int ranks, double secs)
 {
     /* get number of items created so far */
