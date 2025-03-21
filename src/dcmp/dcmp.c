@@ -1040,10 +1040,9 @@ static int dcmp_strmap_compare(
         dcmp_strmap_item_update(src_map, key, DCMPF_EXIST, DCMPS_COMMON);
         dcmp_strmap_item_update(dst_map, key, DCMPF_EXIST, DCMPS_COMMON);
 
-        mfu_filetype src_type =  mfu_flist_file_get_type(src_list,
-            src_index);
-        mfu_filetype dst_type =  mfu_flist_file_get_type(dst_list,
-            dst_index);
+        /* get types of files */
+        mfu_filetype src_type =  mfu_flist_file_get_type(src_list, src_index);
+        mfu_filetype dst_type =  mfu_flist_file_get_type(dst_list, dst_index);
 
         tmp_rc = dcmp_compare_metadata(src_list, src_map, src_index,
              dst_list, dst_map, dst_index,
