@@ -397,8 +397,6 @@ static int encode_header(
     archive_entry_copy_pathname(entry, relname);
     mfu_free(&relname);
 
-
-
     /* determine whether user wants to encode ACLs and xattrs */
     bool preserve = (opts->preserve_xattrs || opts->preserve_acls || opts->preserve_fflags);
     if (preserve) {
@@ -765,7 +763,6 @@ static void DTAR_perform_copy(CIRCLE_handle* handle)
 
     /* get name of user file */
     const char* in_name = op->operand;
-    MFU_LOG(MFU_LOG_INFO, "DTAR_perform_copy '%s'", in_name);
 
     /* open input file for reading */
     int read_flag = 1;
@@ -2387,7 +2384,6 @@ static int mfu_flist_archive_create_copy_chunk(
         if (opts->open_noatime) {
             flags |= O_NOATIME;
         }
-
         int in_fd = mfu_open(in_name, flags);
         if (in_fd < 0) {
             MFU_LOG(MFU_LOG_ERR, "Failed to open source file '%s' errno=%d %s",
@@ -2685,9 +2681,11 @@ int mfu_flist_archive_create(
 
     /* write headers for our files */
     for (idx = 0; idx < listsize; idx++) {
-        /* we currently only support regular files, directories, and symlinks */
+        /* we currently only support regular files, directories, symlinks and
+         * hardlinks. */
         mfu_filetype type = mfu_flist_file_get_type(flist, idx);
-        if (type == MFU_TYPE_FILE || type == MFU_TYPE_DIR || type == MFU_TYPE_LINK || type == MFU_TYPE_HARDLINK) {
+        if (type == MFU_TYPE_FILE || type == MFU_TYPE_DIR ||
+            type == MFU_TYPE_LINK || type == MFU_TYPE_HARDLINK) {
             /* write header for this item to the archive,
              * this sets DTAR_err on any error */
             write_header(flist, idx, cwdpath,
@@ -4258,6 +4256,57 @@ static void extract1_progress_fn(const uint64_t* vals, int count, int complete, 
     }
 }
 
+/* extract list of entries from archive, update progress and free the list */
+static int extract_archive_list_entries(struct archive* ext, entry_list_t** entries) {
+
+    /* assume we'll succeed */
+    int rc = MFU_SUCCESS;
+    entry_list_t *current_entry = NULL, *previous_entry = NULL;
+
+    current_entry = *entries;
+    while(current_entry && rc == MFU_SUCCESS) {
+        /* create entry on disk */
+        int r = archive_write_header(ext, current_entry->entry);
+        if (r != ARCHIVE_OK) {
+            MFU_LOG(MFU_LOG_ERR, "writing entry %s",
+                archive_error_string(ext)
+            );
+            rc = MFU_FAILURE;
+            break;
+        }
+
+        /* set any properties on the item that need to be set at end,
+        * e.g., turn off write bit on a file we just wrote or set timestamps */
+        r = archive_write_finish_entry(ext);
+        if (r != ARCHIVE_OK) {
+            MFU_LOG(MFU_LOG_ERR, "finish writing entry %s",
+                archive_error_string(ext)
+            );
+            rc = MFU_FAILURE;
+            break;
+        }
+
+        /* increment our count of items extracted */
+        reduce_buf[REDUCE_ITEMS]++;
+
+        /* update number of items we have completed for progress messages */
+        mfu_progress_update(reduce_buf, extract_prog);
+
+        /* jump to next entry and free current entry */
+        previous_entry = current_entry;
+        current_entry = current_entry->next;
+        archive_entry_free(previous_entry->entry);
+        mfu_free(&previous_entry);
+        previous_entry = NULL;
+    }
+
+    /* Free entries list */
+    *entries = NULL;
+
+    return rc;
+}
+
+
 /* compute total bytes in regular files in flist */
 static uint64_t flist_sum_bytes(mfu_flist flist)
 {
@@ -4280,6 +4329,22 @@ static uint64_t flist_sum_bytes(mfu_flist flist)
     uint64_t total_bytes;
     MPI_Allreduce(&bytes, &total_bytes, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
     return total_bytes;
+}
+
+/* append a copy of entry in entries list and move current */
+static void entries_list_add(entry_list_t** entries, entry_list_t** current, struct archive_entry* entry) {
+    entry_list_t* new_entry = (entry_list_t*) malloc(sizeof(entry_list_t));
+    new_entry->entry = archive_entry_clone(entry);
+    new_entry->next = NULL;
+    if(!*entries) {
+        *entries = new_entry;
+    }
+    if(!*current) {
+        *current = new_entry;
+    } else {
+        (*current)->next = new_entry;
+        *current = (*current)->next;
+    }
 }
 
 /* Extract items from a given archive file, given the offset of each entry in the archive.
@@ -4408,20 +4473,10 @@ static int extract_files_offsets_libarchive(
             break;
         }
 
-        /* if hardlink entry, keep a copy of this entry for processing in 2nd pass */
+        /* if hardlink entry, add a copy of this entry in hardlink_entries list
+         * for later processing */
         if (archive_entry_hardlink(entry) != NULL) {
-            entry_list_t* new_entry = (entry_list_t*) malloc(sizeof(entry_list_t));
-            new_entry->entry = archive_entry_clone(entry);
-            new_entry->next = NULL;
-            if(!hardlink_entries) {
-                hardlink_entries = new_entry;
-            }
-            if(!current_hardlink_entry) {
-                current_hardlink_entry = new_entry;
-            } else {
-                current_hardlink_entry->next = new_entry;
-                current_hardlink_entry = current_hardlink_entry->next;
-            }
+            entries_list_add(&hardlink_entries, &current_hardlink_entry, entry);
             /* advance to our next entry */
             count++;
             continue;
@@ -4494,44 +4549,12 @@ static int extract_files_offsets_libarchive(
     /* wait for all tasks to write regular files */
     MPI_Barrier(MPI_COMM_WORLD);
 
-    current_hardlink_entry = hardlink_entries;
-    while(current_hardlink_entry && rc == MFU_SUCCESS) {
-        /* create hardlink on disk */
-        r = archive_write_header(ext, current_hardlink_entry->entry);
-        if (r != ARCHIVE_OK) {
-            MFU_LOG(MFU_LOG_ERR, "writing entry %s",
-                archive_error_string(ext)
-            );
-            rc = MFU_FAILURE;
-            break;
-        }
-
-        /* set any properties on the item that need to be set at end,
-         * e.g., turn off write bit on a file we just wrote or set timestamps */
-        r = archive_write_finish_entry(ext);
-        if (r != ARCHIVE_OK) {
-            MFU_LOG(MFU_LOG_ERR, "finish writing entry %s",
-                archive_error_string(ext)
-            );
-            rc = MFU_FAILURE;
-            break;
-        }
-
-        /* increment our count of items extracted */
-        reduce_buf[REDUCE_ITEMS]++;
-
-        /* update number of items we have completed for progress messages */
-        mfu_progress_update(reduce_buf, extract_prog);
-
-        /* jump to next hardlink and free current hardlink entry*/
-        entry_list_t* previous_hardlink_entry = current_hardlink_entry;
-        current_hardlink_entry = current_hardlink_entry->next;
-        archive_entry_free(previous_hardlink_entry->entry);
-        free(previous_hardlink_entry);
-        previous_hardlink_entry = NULL;
+    /* extract pending hardlinks entries */
+    r = extract_archive_list_entries(ext, &hardlink_entries);
+    if (r != MFU_SUCCESS) {
+        MFU_LOG(MFU_LOG_ERR, "Failed to extract hardlink entries for archive");
+        rc = MFU_FAILURE;
     }
-    /* Free hardlinks entries list */
-    hardlink_entries = NULL;
 
     /* close out our write archive, this may update timestamps and permissions on items */
     r = archive_write_close(ext);
@@ -4956,20 +4979,11 @@ static int extract_files(
 
         /* write item out to disk if this is one of our assigned items */
         if (count % ranks == mfu_rank) {
-            /* ff hardlink entry, keep a copy of this entry for processing in 2nd pass */
+
+            /* if hardlink entry, add a copy of this entry in hardlink_entries list
+            * for later processing */
             if (archive_entry_hardlink(entry) != NULL) {
-                entry_list_t* new_entry = (entry_list_t*) malloc(sizeof(entry_list_t));
-                new_entry->entry = archive_entry_clone(entry);
-                new_entry->next = NULL;
-                if(!hardlink_entries) {
-                    hardlink_entries = new_entry;
-                }
-                if(!current_hardlink_entry) {
-                    current_hardlink_entry = new_entry;
-                } else {
-                    current_hardlink_entry->next = new_entry;
-                    current_hardlink_entry = current_hardlink_entry->next;
-                }
+                entries_list_add(&hardlink_entries, &current_hardlink_entry, entry);
                 /* advance to next entry in the archive */
                 count++;
                 continue;
@@ -5017,44 +5031,12 @@ static int extract_files(
     /* wait for all tasks to write regular files */
     MPI_Barrier(MPI_COMM_WORLD);
 
-    current_hardlink_entry = hardlink_entries;
-    while(current_hardlink_entry && rc == MFU_SUCCESS) {
-        /* create hardlink on disk */
-        r = archive_write_header(ext, current_hardlink_entry->entry);
-        if (r != ARCHIVE_OK) {
-            MFU_LOG(MFU_LOG_ERR, "writing entry %s",
-                archive_error_string(ext)
-            );
-            rc = MFU_FAILURE;
-            break;
-        }
-
-        /* set any properties on the item that need to be set at end,
-         * e.g., turn off write bit on a file we just wrote or set timestamps */
-        r = archive_write_finish_entry(ext);
-        if (r != ARCHIVE_OK) {
-            MFU_LOG(MFU_LOG_ERR, "finish writing entry %s",
-                archive_error_string(ext)
-            );
-            rc = MFU_FAILURE;
-            break;
-        }
-
-        /* increment our count of items extracted */
-        reduce_buf[REDUCE_ITEMS]++;
-
-        /* update number of items we have completed for progress messages */
-        mfu_progress_update(reduce_buf, extract_prog);
-
-        /* jump to next hardlink and free current hardlink entry*/
-        entry_list_t* previous_hardlink_entry = current_hardlink_entry;
-        current_hardlink_entry = current_hardlink_entry->next;
-        archive_entry_free(previous_hardlink_entry->entry);
-        free(previous_hardlink_entry);
-        previous_hardlink_entry = NULL;
+    /* extract pending hardlinks entries */
+    r = extract_archive_list_entries(ext, &hardlink_entries);
+    if (r != MFU_SUCCESS) {
+        MFU_LOG(MFU_LOG_ERR, "Failed to extract hardlink entries for archive");
+        rc = MFU_FAILURE;
     }
-    /* Free hardlinks entries list */
-    hardlink_entries = NULL;
 
     /* free off our write archive, this may update timestamps and permissions on items */
     r = archive_write_close(ext);
